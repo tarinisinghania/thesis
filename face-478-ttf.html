@@ -1,0 +1,952 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>478</title>
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Black&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;background:#000;color:#fff;overflow:hidden}
+body{font:11px/1.4 "Courier New",ui-monospace,monospace}
+/* left: the camera, full height · right (bigger): the typeface above, the controls below */
+.split{display:grid;grid-template-columns:38fr 62fr;height:100%}
+.left{position:relative;border-right:1px solid #fff;min-width:0}
+.right{display:flex;flex-direction:column;min-width:0;min-height:0}
+#c{flex:1 1 0;width:100%;height:0;min-height:0;display:block}
+.cam{position:absolute;inset:0;cursor:pointer;background:#000;overflow:hidden}
+.cam video,.cam canvas{position:absolute;inset:0;width:100%;height:100%;transform:scaleX(-1);object-fit:cover}
+.cam video{opacity:.35;filter:grayscale(1)}
+.cam span{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px}
+#prompt{position:absolute;left:0;right:0;bottom:12%;text-align:center;color:#fff;font-size:clamp(18px,2.4vw,30px);white-space:pre-line;text-shadow:0 0 10px #000,0 0 3px #000;pointer-events:none}
+.cam.on span{display:none}
+.controls{border-top:1px solid #fff;padding:14px 16px 16px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px 24px;align-items:end}
+@media (max-width:1000px){ .controls{grid-template-columns:repeat(2,minmax(0,1fr))} }
+.links{display:flex;flex-wrap:wrap;gap:6px 12px}
+.links button{all:unset;cursor:pointer;color:#fff;text-decoration:underline}
+.links button:disabled{color:#555;cursor:default;text-decoration:none}
+.links button:focus-visible,.cam:focus-visible,input:focus-visible{outline:1px solid #fff;outline-offset:2px}
+.group{display:flex;flex-direction:column;gap:6px}
+#status{color:#777;margin:0;min-height:1.4em}
+label{display:block;margin:0;color:#aaa}
+label b{float:right;font-weight:400;color:#fff}
+input[type=text]{display:block;width:100%;margin-top:3px;font:inherit;font-size:13px;color:#fff;background:transparent;border:0;border-bottom:1px solid #fff;border-radius:0;padding:2px 0}
+input[type=range]{display:block;width:100%;margin:4px 0 0;accent-color:#fff}
+@media (max-width:760px){
+  html,body{overflow:auto}
+  .split{grid-template-columns:1fr;grid-template-rows:42vh auto;height:auto}
+  .left{border-right:0;border-bottom:1px solid #fff}
+  #c{flex:none;height:55vh}
+}
+</style>
+</head>
+<body>
+<div class="split">
+  <div class="left">
+    <div class="cam" id="camBtn" role="button" tabindex="0" aria-label="Start or stop camera"><video id="video" playsinline muted></video><canvas id="mesh"></canvas><span>start camera</span><div id="prompt" aria-live="assertive"></div></div>
+  </div>
+  <div class="right">
+    <canvas id="c" aria-label="Letters drawn by face points"></canvas>
+    <div class="controls">
+      <div class="group">
+        <div class="links"><button id="freezeBtn" disabled>freeze</button><button id="calBtn" disabled>reset</button><button id="posesBtn" disabled>record poses</button><button id="savePng">save</button></div>
+        <div class="links"><button id="modeBtn">mapping: random</button><button id="shuffleBtn">shuffle</button></div>
+        <p id="status"></p>
+      </div>
+      <label>word<input type="text" id="text" value="Hello" maxlength="10" spellcheck="false"></label>
+      <div class="group">
+        <label>font name<input type="text" id="fontName" value="Reflect Face" maxlength="28" spellcheck="false"></label>
+        <div class="links"><button id="ttfVarBtn">download variable ttf</button></div>
+      </div>
+      <label>face shape <b id="shapeVal">4×</b><input type="range" id="shape" min="0" max="12" step="0.5" value="4"></label>
+      <label>expression <b id="gainVal">3×</b><input type="range" id="gain" min="0" max="12" value="3"></label>
+      <label>resting length <b id="baseVal">20</b><input type="range" id="base" min="0" max="60" value="20"></label>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+/* =====================================================================
+   478 — every MediaPipe face landmark controls one line in each letter
+
+   STEP 1  Capture:      MediaPipe gives 478 points per video frame.
+   STEP 2  Normalize:    centre, level and scale the points so only
+                         the SHAPE of the face matters.
+   STEP 3  Neutral:      average a relaxed face; afterwards we only use
+                         how far each point has moved from it (the delta).
+   STEP 4  Map:          give each letter 478 anchor points on its
+                         outline. Face point i is paired with the anchor
+                         in the same direction from the centre, so
+                         forehead points control the top of the letter,
+                         chin points the bottom, cheeks the sides.
+   STEP 5  Move & draw:  each line starts on its anchor; its tip is
+                         pushed by the matching face point's delta.
+   ===================================================================== */
+
+const N = 478;
+const $ = id => document.getElementById(id);
+const canvas = $('c'), ctx = canvas.getContext('2d');
+const off = document.createElement('canvas'), octx = off.getContext('2d', {willReadFrequently:true});
+const glow = document.createElement('canvas'), gctx = glow.getContext('2d');
+const FONT = '"Archivo Black", Impact, "Arial Black", sans-serif';
+const S = {text:'Hello', gain:3, shape:4, base:20, angle:0};   // angle: lines rest straight up
+let W = 1, H = 1, dpr = 1, dirty = true;
+
+/* ---------- STEP 4 (type side): every outline pixel becomes a line ---------- */
+// pts stride 7: x, y, normalX, normalY, random, letterIndex, turn (0 = top of letter, clockwise to 1)
+let letters = [], pts = new Float32Array(0);
+let markers = [];   // markers[li][i] = index in pts of the line directly controlled by face point i
+
+function layout(){
+  const r = canvas.getBoundingClientRect();
+  W = Math.max(1, r.width); H = Math.max(1, r.height);
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = glow.width = W * dpr; canvas.height = glow.height = H * dpr;
+  letters = [];
+  const text = S.text;
+  if (!text.trim()){ pts = new Float32Array(0); dirty = true; return; }
+  off.width = Math.ceil(W); off.height = Math.ceil(H);
+  octx.clearRect(0, 0, W, H);
+  octx.font = `100px ${FONT}`;
+  let m = octx.measureText(text);
+  const gutter = 0, avail = W;   // the typeface has the right-hand panel to itself
+  const fs = 100 * Math.min(avail * 0.82 / m.width, H * 0.4 / ((m.actualBoundingBoxAscent + m.actualBoundingBoxDescent) || 75));
+  octx.font = `${fs}px ${FONT}`; m = octx.measureText(text);
+  const asc = m.actualBoundingBoxAscent, desc = m.actualBoundingBoxDescent;
+  const capPx = octx.measureText('H').actualBoundingBoxAscent || asc;   // cap height: the same yardstick the font file uses
+  const left = gutter + avail / 2 - m.width / 2, base = H / 2 + (asc - desc) / 2;
+  let prev = left;
+  for (let i = 0; i < text.length; i++){
+    const x1 = left + octx.measureText(text.slice(0, i + 1)).width;
+    const up = text[i].toUpperCase(), key = up >= 'A' && up <= 'Z' ? up.charCodeAt(0) - 65 : 26 + text.charCodeAt(i);
+    // centre = middle of the letter's width, half way up the cap height (identical rule in the font file)
+    letters.push({x0: prev, x1, cx: (prev + x1) / 2, cy: base - capPx / 2, h: capPx, top: base - capPx, key}); prev = x1;
+  }
+  // trace the outline at double resolution: twice as many lines along every edge
+  const SS = 2;
+  off.width = Math.ceil(W * SS); off.height = Math.ceil(H * SS);
+  octx.setTransform(SS, 0, 0, SS, 0, 0); octx.font = `${fs}px ${FONT}`; octx.textBaseline = 'alphabetic';
+  octx.fillStyle = '#000'; octx.fillText(text, left, base); octx.setTransform(1, 0, 0, 1, 0, 0);
+  const w = off.width, h = off.height, img = octx.getImageData(0, 0, w, h).data;
+  const colLetter = new Int16Array(w);
+  for (let x = 0, i = 0; x < w; x++){ while (i < letters.length - 1 && x / SS >= letters[i].x1) i++; colLetter[x] = i; }
+  const A = (x, y) => img[(y * w + x) * 4 + 3];
+  const out = [], R = 3;
+  for (let y = R; y < h - R; y++) for (let x = R; x < w - R; x++){
+    if (A(x, y) < 128) continue;
+    if (A(x-1, y) >= 128 && A(x+1, y) >= 128 && A(x, y-1) >= 128 && A(x, y+1) >= 128) continue;
+    let gx = 0, gy = 0;
+    for (let dy = -R; dy <= R; dy++) for (let dx = -R; dx <= R; dx++){ const v = A(x+dx, y+dy); gx += v*dx; gy += v*dy; }
+    const l = Math.hypot(gx, gy) || 1, li = colLetter[x], L = letters[li];
+    const hsh = Math.abs(Math.sin(x*12.9898 + y*78.233) * 43758.5453) % 1;
+    const px = x / SS, py = y / SS;
+    const turn = (Math.atan2(py - L.cy, px - L.cx) / (Math.PI * 2) + 1.25) % 1;
+    out.push(px, py, -gx/l, -gy/l, hsh, li, turn);
+  }
+  pts = new Float32Array(out);
+  buildMapping();
+  dirty = true;
+}
+
+/* each face point i owns the outline line whose turn is closest to the point's own turn on the face */
+function buildMarkers(){
+  markers = letters.map(() => new Int32Array(N).fill(-1));
+  const best = letters.map(() => new Float32Array(N).fill(9));
+  for (let j = 0; j < pts.length; j += 7){
+    const li = pts[j+5], t = pts[j+6];
+    for (let i = 0; i < N; i++){
+      const d = Math.abs(((t - letterTurn[li][i]) % 1 + 1.5) % 1 - 0.5);
+      if (d < best[li][i]){ best[li][i] = d; markers[li][i] = j; }
+    }
+  }
+}
+
+/* ---------- STEP 2: normalize one frame of landmarks ---------- */
+// returns Float32Array(N*2): x,y for each point, centred on the face,
+// rotated so the eyes are level, divided by face width, mirrored like a mirror
+function normalize(lm, vw, vh){
+  const px = i => lm[i].x * vw, py = i => lm[i].y * vh;   // 0–1 → pixels, so angles aren't distorted
+  let mx = 0, my = 0;
+  for (let i = 0; i < N; i++){ mx += px(i); my += py(i); }
+  mx /= N; my /= N;                                          // face centre
+  const ang = Math.atan2(py(263) - py(33), px(263) - px(33)); // eye line angle
+  const size = Math.hypot(px(454) - px(234), py(454) - py(234)) || 1; // face width
+  const c = Math.cos(-ang), s = Math.sin(-ang), out = new Float32Array(N * 2);
+  for (let i = 0; i < N; i++){
+    const dx = px(i) - mx, dy = py(i) - my;
+    out[i*2]     = -(dx * c - dy * s) / size;   // minus = mirror
+    out[i*2 + 1] =  (dx * s + dy * c) / size;
+  }
+  return out;
+}
+
+/* ---------- STEP 3a: the reference face ----------
+   MediaPipe's canonical face model: the standard, average face the tracker is built around
+   (canonical_face_model.obj from the MediaPipe repository, x and y in cm, y pointing up).
+   It has the same point numbering as the live landmarks for points 0–467; the 10 iris
+   points (468–477) have no reference, so they never add to the resting shape. */
+const CANON = [0.0, -3.406, 0.0, -1.127, 0.0, -2.089, -0.464, 0.955, 0.0, -0.463, 0.0, 0.366, 0.0, 2.473, -4.253, 2.578, 0.0, 4.019, 0.0, 4.886, 0.0, 8.262, 0.0, -3.707, 0.0, -3.918, 0.0, -3.994, 0.0, -4.542, 0.0, -4.746, 0.0, -5.02, 0.0, -5.365, 0.0, -6.15, 0.0, -1.501, -0.416, -1.466, -7.088, 5.435, -2.629, 2.036, -3.198, 1.986, -3.775, 2.039, -4.466, 2.423, -2.164, 2.19, -3.208, 3.224, -2.674, 3.205, -3.745, 3.165, -4.161, 3.059, -5.062, 1.934, -2.267, -7.426, -4.446, 2.664, -7.215, 2.263, -5.8, 2.35, -2.845, -0.721, -0.711, -3.329, -0.606, -3.925, -1.432, -3.501, -1.915, -3.803, -1.131, -3.974, -1.564, -4.083, -2.65, -5.004, -0.427, -1.094, -0.496, -0.476, -5.253, 3.882, -1.719, 0.975, -1.609, -0.943, -1.651, -0.611, -4.766, -0.702, -0.478, 0.296, -3.735, 4.508, -4.589, 4.302, -6.279, 6.615, -1.221, 4.142, -2.193, 3.1, -3.103, -4.353, -6.72, -4.789, -1.194, -1.307, -0.73, -1.594, -2.456, -4.343, -2.205, -4.305, -4.986, 4.802, -1.592, -1.258, -2.645, 4.525, -2.76, 5.101, -3.524, 8.006, -5.6, 5.715, -3.064, 6.566, -5.721, 4.255, -6.374, 4.786, -0.673, -3.688, -1.263, -3.788, -1.733, -3.953, -1.044, -1.465, -2.321, -4.329, -2.057, -4.478, -2.153, -4.276, -0.947, -1.035, -1.469, -4.036, -1.024, -3.99, -0.533, -3.993, -0.77, -6.095, -0.7, -5.292, -0.67, -4.95, -0.631, -4.695, -0.583, -4.518, -1.537, -4.423, -1.616, -4.476, -1.729, -4.619, -1.839, -4.829, -2.368, -3.106, -7.542, -1.049, 0.0, -1.724, -1.827, -4.4, -1.93, -4.412, -0.597, -2.014, -1.406, -1.714, -0.662, -1.819, -2.342, 0.572, -3.327, 0.105, -1.726, -0.919, -5.133, 7.486, -4.539, 6.32, -3.987, 5.109, -2.17, -5.44, -1.396, 5.012, -1.619, 6.599, -1.891, 8.236, -4.196, 2.235, -5.733, 1.412, -1.86, 2.356, -4.989, 3.075, -1.303, 1.416, -1.306, -0.673, -6.465, 0.937, -5.259, 0.946, -4.432, 0.722, -3.301, 0.862, -2.43, 1.131, -1.821, 1.468, -0.563, 2.308, -6.338, -0.529, -5.588, 3.208, -0.243, -1.463, -1.611, 0.339, -7.743, 2.365, -1.391, 1.851, -1.786, -0.978, -4.671, 2.664, -1.334, -0.284, -7.271, -2.891, -1.856, 2.585, -0.923, 0.073, -5.001, -6.135, -5.085, -7.179, -7.159, -0.812, -5.843, -5.248, -6.847, 3.663, -2.413, -8.259, -0.18, -1.69, -2.104, -0.164, -6.408, 2.236, -3.67, 2.36, -3.177, 2.294, -2.196, -4.598, -6.235, -1.944, -1.293, -9.296, -3.211, -8.533, -4.069, -7.993, 0.0, 6.545, 0.0, -9.403, -2.724, 2.316, -2.288, 2.399, -1.998, 2.497, -6.13, 3.399, -2.288, 2.887, -2.724, 2.962, -3.177, 2.964, -3.67, 2.928, -4.018, 2.857, -7.556, 4.107, -4.018, 2.484, 0.0, -2.522, -1.776, -2.684, -1.222, -1.182, -0.731, -2.537, 0.0, 3.271, -4.135, -6.997, -3.312, -7.661, -1.314, -8.64, -5.941, -6.224, -1.998, 2.744, -0.901, 1.237, 0.0, -8.765, -2.309, -8.974, -6.954, -2.44, -1.099, -4.459, -1.181, -4.58, -1.256, -4.788, -1.325, -5.107, -1.546, -5.819, -1.954, -4.184, -2.118, -4.137, -2.285, -4.051, -2.85, -3.666, -5.279, -2.239, -0.947, 1.908, -1.314, 3.105, -1.78, 2.86, -1.845, -4.099, -5.436, -4.03, -0.766, 3.182, -1.939, -6.614, 0.0, 1.059, -0.517, 1.584, 0.0, 1.728, -1.247, 0.23, 0.0, -7.942, 0.0, -6.991, -0.998, -6.931, -3.289, -5.383, -2.312, -1.566, -2.68, -6.112, -3.833, -1.537, -2.962, -2.274, -4.387, -2.683, -1.217, -7.834, -1.542, -0.137, -3.878, -6.042, -3.084, -6.81, -3.747, -4.504, -6.094, -3.206, -4.589, -4.729, -6.583, -3.941, -3.493, -3.196, -1.256, 0.802, -1.126, -0.934, -1.443, -1.143, -0.923, -0.529, -1.755, 3.529, -2.633, 3.714, -3.388, 3.722, -4.076, 3.675, -4.623, 3.475, -5.172, 2.536, -7.297, 0.763, -4.707, 1.651, -4.072, 1.477, -3.27, 1.471, -2.528, 1.617, -1.971, 1.859, -1.58, 2.098, -7.664, 0.673, -1.397, -1.34, -0.885, 0.659, -0.767, -0.968, -0.46, -1.334, -0.749, -1.068, -1.236, -1.586, -0.387, -1.41, -0.32, -1.608, -1.64, 2.556, -1.256, 2.467, -1.031, 2.383, -4.253, 2.772, -4.53, 2.91, 0.464, 0.955, 4.253, 2.578, 0.416, -1.466, 7.088, 5.435, 2.629, 2.036, 3.198, 1.986, 3.775, 2.039, 4.466, 2.423, 2.164, 2.19, 3.208, 3.224, 2.674, 3.205, 3.745, 3.165, 4.161, 3.059, 5.062, 1.934, 2.267, -7.426, 4.446, 2.664, 7.215, 2.263, 5.8, 2.35, 2.845, -0.721, 0.711, -3.329, 0.606, -3.925, 1.432, -3.501, 1.915, -3.803, 1.131, -3.974, 1.564, -4.083, 2.65, -5.004, 0.427, -1.094, 0.496, -0.476, 5.253, 3.882, 1.719, 0.975, 1.609, -0.943, 1.651, -0.611, 4.766, -0.702, 0.478, 0.296, 3.735, 4.508, 4.589, 4.302, 6.279, 6.615, 1.221, 4.142, 2.193, 3.1, 3.103, -4.353, 6.72, -4.789, 1.194, -1.307, 0.73, -1.594, 2.456, -4.343, 2.205, -4.305, 4.986, 4.802, 1.592, -1.258, 2.645, 4.525, 2.76, 5.101, 3.524, 8.006, 5.6, 5.715, 3.064, 6.566, 5.721, 4.255, 6.374, 4.786, 0.673, -3.688, 1.263, -3.788, 1.733, -3.953, 1.044, -1.465, 2.321, -4.329, 2.057, -4.478, 2.153, -4.276, 0.947, -1.035, 1.469, -4.036, 1.024, -3.99, 0.533, -3.993, 0.77, -6.095, 0.7, -5.292, 0.67, -4.95, 0.631, -4.695, 0.583, -4.518, 1.537, -4.423, 1.616, -4.476, 1.729, -4.619, 1.839, -4.829, 2.368, -3.106, 7.542, -1.049, 1.827, -4.4, 1.93, -4.412, 0.597, -2.014, 1.406, -1.714, 0.662, -1.819, 2.342, 0.572, 3.327, 0.105, 1.726, -0.919, 5.133, 7.486, 4.539, 6.32, 3.987, 5.109, 2.17, -5.44, 1.396, 5.012, 1.619, 6.599, 1.891, 8.236, 4.196, 2.235, 5.733, 1.412, 1.86, 2.356, 4.989, 3.075, 1.303, 1.416, 1.306, -0.673, 6.465, 0.937, 5.259, 0.946, 4.432, 0.722, 3.301, 0.862, 2.43, 1.131, 1.821, 1.468, 0.563, 2.308, 6.338, -0.529, 5.588, 3.208, 0.243, -1.463, 1.611, 0.339, 7.743, 2.365, 1.391, 1.851, 1.786, -0.978, 4.671, 2.664, 1.334, -0.284, 7.271, -2.891, 1.856, 2.585, 0.923, 0.073, 5.001, -6.135, 5.085, -7.179, 7.159, -0.812, 5.843, -5.248, 6.847, 3.663, 2.413, -8.259, 0.18, -1.69, 2.104, -0.164, 6.408, 2.236, 3.67, 2.36, 3.177, 2.294, 2.196, -4.598, 6.235, -1.944, 1.293, -9.296, 3.211, -8.533, 4.069, -7.993, 2.724, 2.316, 2.288, 2.399, 1.998, 2.497, 6.13, 3.399, 2.288, 2.887, 2.724, 2.962, 3.177, 2.964, 3.67, 2.928, 4.018, 2.857, 7.556, 4.107, 4.018, 2.484, 1.776, -2.684, 1.222, -1.182, 0.731, -2.537, 4.135, -6.997, 3.312, -7.661, 1.314, -8.64, 5.941, -6.224, 1.998, 2.744, 0.901, 1.237, 2.309, -8.974, 6.954, -2.44, 1.099, -4.459, 1.181, -4.58, 1.256, -4.788, 1.325, -5.107, 1.546, -5.819, 1.954, -4.184, 2.118, -4.137, 2.285, -4.051, 2.85, -3.666, 5.279, -2.239, 0.947, 1.908, 1.314, 3.105, 1.78, 2.86, 1.845, -4.099, 5.436, -4.03, 0.766, 3.182, 1.939, -6.614, 0.517, 1.584, 1.247, 0.23, 0.998, -6.931, 3.289, -5.383, 2.312, -1.566, 2.68, -6.112, 3.833, -1.537, 2.962, -2.274, 4.387, -2.683, 1.217, -7.834, 1.542, -0.137, 3.878, -6.042, 3.084, -6.81, 3.747, -4.504, 6.094, -3.206, 4.589, -4.729, 6.583, -3.941, 3.493, -3.196, 1.256, 0.802, 1.126, -0.934, 1.443, -1.143, 0.923, -0.529, 1.755, 3.529, 2.633, 3.714, 3.388, 3.722, 4.076, 3.675, 4.623, 3.475, 5.172, 2.536, 7.297, 0.763, 4.707, 1.651, 4.072, 1.477, 3.27, 1.471, 2.528, 1.617, 1.971, 1.859, 1.58, 2.098, 7.664, 0.673, 1.397, -1.34, 0.885, 0.659, 0.767, -0.968, 0.46, -1.334, 0.749, -1.068, 1.236, -1.586, 0.387, -1.41, 0.32, -1.608, 1.64, 2.556, 1.256, 2.467, 1.031, 2.383, 4.253, 2.772, 4.53, 2.91];
+const NC = 468;
+// put the reference face in the same space as a normalized live face: image y points down, mirrored
+const ref = new Float32Array(NC * 2);
+for (let i = 0; i < NC; i++){ ref[i*2] = -CANON[i*2]; ref[i*2+1] = -CANON[i*2+1]; }
+
+const shape = new Float32Array(N * 2);   // how each point of YOUR relaxed face differs from the reference
+
+/* Line the reference face up with your relaxed face as closely as possible (best-fit move,
+   turn and resize, "Procrustes alignment"), then measure what's left over. What's left is
+   only proportion — wider jaw, higher brows, fuller lips — not position, tilt or size. */
+function computeShape(){
+  shape.fill(0);
+  if (!neutral) return;
+  let rx = 0, ry = 0, nx = 0, ny = 0;
+  for (let i = 0; i < NC; i++){ rx += ref[i*2]; ry += ref[i*2+1]; nx += neutral[i*2]; ny += neutral[i*2+1]; }
+  rx /= NC; ry /= NC; nx /= NC; ny /= NC;
+  let a = 0, b = 0, norm = 0;
+  for (let i = 0; i < NC; i++){
+    const cx = ref[i*2] - rx, cy = ref[i*2+1] - ry, px = neutral[i*2] - nx, py = neutral[i*2+1] - ny;
+    a += cx * px + cy * py; b += cx * py - cy * px; norm += cx * cx + cy * cy;
+  }
+  a /= norm; b /= norm;                   // a = scale·cos(turn), b = scale·sin(turn)
+  for (let i = 0; i < NC; i++){
+    const cx = ref[i*2] - rx, cy = ref[i*2+1] - ry;
+    const fx = a * cx - b * cy + nx, fy = b * cx + a * cy + ny;    // reference point, fitted onto your face
+    shape[i*2] = neutral[i*2] - fx; shape[i*2+1] = neutral[i*2+1] - fy;
+  }
+}
+
+/* ---------- STEP 3: neutral face and deltas ---------- */
+let neutral = null;           // Float32Array(N*2), the relaxed face
+let calib = [];               // frames collected while calibrating
+// default turns before calibration: spread evenly so markers exist
+const faceTurn = Float32Array.from({length:N}, (_, i) => i / N);
+const delta = new Float32Array(N * 2);   // smoothed movement of each point from neutral
+let frozen = false;
+
+function setNeutral(frames){
+  neutral = new Float32Array(N * 2);
+  for (const f of frames) for (let j = 0; j < N * 2; j++) neutral[j] += f[j] / frames.length;
+  // STEP 4 (face side): each face point's direction around the face centre,
+  // measured the same way as on the letters (0 = top, clockwise to 1)
+  for (let i = 0; i < N; i++) faceTurn[i] = (Math.atan2(neutral[i*2+1], neutral[i*2]) / (Math.PI * 2) + 1.25) % 1;
+  computeShape();
+  delta.fill(0); buildMapping();
+}
+
+function update(cur){
+  if (!neutral){
+    calib.push(cur);
+    status(`look straight, relax… ${Math.round(calib.length / 45 * 100)}%`);
+    if (calib.length >= 45){ setNeutral(calib); calib = []; status('tracking'); }
+    return;
+  }
+  if (poseRec) poseRec.push(cur);                                                   // recording a pose
+  if (frozen) return;
+  for (let j = 0; j < N * 2; j++) delta[j] += ((cur[j] - neutral[j]) - delta[j]) * 0.35;  // smoothing
+  dirty = true;
+}
+
+/* ---------- STEP 4b: which face points steer which part of each letter ----------
+   matched: every letter uses the face's own clock (brows → top, jaw → bottom).
+   random:  the face is split into K small regions of neighbouring points (brow, eye corner,
+            lip corner, part of the jaw…). Each letter gets those regions in its own random
+            order around it, so the same eyebrow moves a different part of every letter.
+            Points stay together inside their region, so the ribbons stay smooth. */
+const K = 18;
+let mode = 'random', seed = 7;
+let group = new Int16Array(N);             // which region each face point belongs to
+let within = new Float32Array(N);          // where the point sits inside its region (0–1)
+let letterTurn = [];                       // letterTurn[li][i] = spot on letter li steered by face point i
+
+function rng(a){ return () => { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+
+function buildGroups(){
+  if (!neutral){ for (let i = 0; i < N; i++){ group[i] = Math.floor(i * K / N); within[i] = (i * K / N) % 1; } return; }
+  // k-means: group face points into K regions by where they sit on the relaxed face
+  const cx = new Float32Array(K), cy = new Float32Array(K);
+  for (let k = 0; k < K; k++){ const i = Math.floor((k + 0.5) * N / K); cx[k] = neutral[i*2]; cy[k] = neutral[i*2+1]; }
+  for (let it = 0; it < 15; it++){
+    for (let i = 0; i < N; i++){
+      let best = 0, bd = Infinity;
+      for (let k = 0; k < K; k++){ const d = (neutral[i*2] - cx[k]) ** 2 + (neutral[i*2+1] - cy[k]) ** 2; if (d < bd){ bd = d; best = k; } }
+      group[i] = best;
+    }
+    const sx = new Float32Array(K), sy = new Float32Array(K), n = new Float32Array(K);
+    for (let i = 0; i < N; i++){ sx[group[i]] += neutral[i*2]; sy[group[i]] += neutral[i*2+1]; n[group[i]]++; }
+    for (let k = 0; k < K; k++) if (n[k]){ cx[k] = sx[k] / n[k]; cy[k] = sy[k] / n[k]; }
+  }
+  // order the points inside each region by angle around the region's centre
+  for (let k = 0; k < K; k++){
+    const ids = []; for (let i = 0; i < N; i++) if (group[i] === k) ids.push(i);
+    ids.sort((a, b) => Math.atan2(neutral[a*2+1] - cy[k], neutral[a*2] - cx[k]) - Math.atan2(neutral[b*2+1] - cy[k], neutral[b*2] - cx[k]));
+    ids.forEach((i, r) => { within[i] = ids.length > 1 ? r / (ids.length - 1) : 0.5; });
+  }
+}
+
+/* the random wiring for letter number li (same seed → same wiring every time) */
+function turnsFor(li){
+  const t = new Float32Array(N);
+  if (mode === 'matched'){ t.set(faceTurn); return t; }
+  const r = rng(seed * 997 + li * 131), slot = Array.from({length:K}, (_, k) => k);
+  for (let k = K - 1; k > 0; k--){ const j = Math.floor(r() * (k + 1)); [slot[k], slot[j]] = [slot[j], slot[k]]; }   // shuffle regions for this letter
+  const flip = Array.from({length:K}, () => r() < 0.5);                                                         // and sometimes reverse a region
+  for (let i = 0; i < N; i++){ const w = flip[group[i]] ? 1 - within[i] : within[i]; t[i] = (slot[group[i]] + 0.08 + 0.84 * w) / K; }
+  return t;
+}
+
+function buildMapping(){
+  buildGroups();
+  // on screen, each letter is wired by its alphabet position, so the same letter always matches the downloaded font
+  letterTurn = letters.map(L => turnsFor(L.key));
+  buildMarkers(); dirty = true;
+}
+
+/* ---------- STEP 5: move & draw (the earlier glowing ribbon style) ---------- */
+// Each face point pushes the lines around its own spot on the letter. Lines between face
+// points blend their neighbours smoothly (a soft weighted average), so the ribbon stays coherent.
+const BINS = 240, SIGMA = 0.012;
+let fields = [];
+function fieldFor(turns, ws = 1, we = 1, vec = null){   // vec: a ready-made push for every face point (used by the variable font)
+  const reach = Math.ceil(SIGMA * 3 * BINS);
+  const field = new Float32Array(BINS * 2), wsum = new Float32Array(BINS);
+  for (let i = 0; i < N; i++){
+    // resting shape (your face vs the reference face) + expression (your face now vs your resting face)
+    const dx = vec ? vec[i*2] : shape[i*2] * S.shape * ws + delta[i*2] * S.gain * we, dy = vec ? vec[i*2+1] : shape[i*2+1] * S.shape * ws + delta[i*2+1] * S.gain * we, c = Math.round(turns[i] * BINS);
+    for (let o = -reach; o <= reach; o++){
+      const b = ((c + o) % BINS + BINS) % BINS;
+      const d = Math.abs(((b / BINS - turns[i]) % 1 + 1.5) % 1 - 0.5);
+      const w = Math.exp(-(d * d) / (2 * SIGMA * SIGMA));
+      field[b*2] += dx * w; field[b*2+1] += dy * w; wsum[b] += w;
+    }
+  }
+  for (let b = 0; b < BINS; b++) if (wsum[b]){ field[b*2] /= wsum[b]; field[b*2+1] /= wsum[b]; }
+  return field;
+}
+function buildField(){ fields = letterTurn.map(t => fieldFor(t)); }   // (wrapped so map's extra arguments aren't passed in)
+const NB = 24;
+// twice as many lines as before, so each one is half as bright: the total light stays the same
+const SHADE = Array.from({length:NB}, (_, i) => `rgba(255,255,255,${(0.045 + 0.19 * i / (NB - 1)).toFixed(3)})`);
+// resting lean of the lines: 0 = straight up, negative leans left (looks tilted back), positive leans right
+const REST = {twist:35, light:300};
+const D2R = Math.PI / 180;
+
+function draw(){
+  buildField();
+  const paths = Array.from({length:NB}, () => new Path2D()), dots = new Path2D();
+  const tips = new Float32Array(pts.length / 7 * 2);
+  const Lr = REST.light * D2R;
+  for (let j = 0, n = 0; j < pts.length; j += 7, n += 2){
+    const x = pts[j], y = pts[j+1], nx = pts[j+2], ny = pts[j+3], hsh = pts[j+4], L = letters[pts[j+5]];
+    const field = fields[pts[j+5]];
+    const sc = 420 / L.h, ang = (S.angle + REST.twist * Math.sin((y - L.top) * sc * 0.017 + (x - L.x0) * sc * 0.008)) * D2R;   // measured per letter, like the font
+    const dep = S.base * L.h / 60;
+    // face movement at this spot around the letter (interpolated between bins)
+    const f = pts[j+6] * BINS, b0 = Math.floor(f) % BINS, b1 = (b0 + 1) % BINS, t = f - Math.floor(f);
+    const lim = L.h * 0.9;
+    const mx = Math.max(-lim, Math.min(lim, (field[b0*2] * (1-t) + field[b1*2] * t) * L.h));
+    const my = Math.max(-lim, Math.min(lim, (field[b0*2+1] * (1-t) + field[b1*2+1] * t) * L.h));
+    const ex = x + Math.sin(ang) * dep + mx, ey = y - Math.cos(ang) * dep + my;
+    tips[n] = ex; tips[n+1] = ey;
+    const na = Math.atan2(ny, nx);
+    let v = 0.5 + 0.3*Math.cos(2*(na - Lr)) + 0.16*Math.cos(5*(na - Lr) + ang*3) + (hsh - 0.5)*0.26;
+    v = Math.max(0, Math.min(1, v));
+    const p = paths[(v * (NB - 1)) | 0]; p.moveTo(x, y); p.lineTo(ex, ey);
+  }
+  // marker dots: the tip of each line one face point directly controls
+  markers.forEach(ml => { for (let i = 0; i < N; i++){ const j = ml[i]; if (j < 0) continue; const n = j / 7 * 2; dots.rect(tips[n] - 1, tips[n+1] - 1, 2, 2); } });
+
+  gctx.setTransform(1,0,0,1,0,0); gctx.clearRect(0, 0, glow.width, glow.height);
+  gctx.setTransform(dpr,0,0,dpr,0,0); gctx.globalCompositeOperation = 'lighter'; gctx.lineWidth = 1.1;
+  paths.forEach((p, i) => { gctx.strokeStyle = SHADE[i]; gctx.stroke(p); });
+  gctx.fillStyle = 'rgba(255,255,255,.55)'; gctx.fill(dots);
+  gctx.globalCompositeOperation = 'source-over';
+
+  ctx.setTransform(dpr,0,0,dpr,0,0); ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  ctx.setTransform(1,0,0,1,0,0); ctx.globalCompositeOperation = 'lighter';
+  ctx.filter = `blur(${5 * dpr}px)`; ctx.globalAlpha = 0.35; ctx.drawImage(glow, 0, 0);
+  ctx.filter = 'none'; ctx.globalAlpha = 1; ctx.drawImage(glow, 0, 0);
+  ctx.globalCompositeOperation = 'source-over';
+  // the standard letter: crisp white outline
+  ctx.setTransform(dpr,0,0,dpr,0,0); ctx.fillStyle = '#FFFFFF';
+  for (let j = 0; j < pts.length; j += 14) ctx.fillRect(pts[j] - .8, pts[j+1] - .8, 1.6, 1.6);   // outline: every other point is enough
+}
+
+/* ---------- STEP 1: camera + MediaPipe ---------- */
+const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+const video = $('video'), mesh = $('mesh'), mctx = mesh.getContext('2d');
+let landmarker = null, stream = null, running = false, lastT = -1;
+const status = t => { $('status').textContent = t; };
+
+async function start(){
+  status('loading…');
+  try {
+    if (!landmarker){
+      const vision = await import(`${MP}/vision_bundle.mjs`);
+      const files = await vision.FilesetResolver.forVisionTasks(`${MP}/wasm`);
+      const opts = d => ({ baseOptions:{ modelAssetPath:'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task', delegate:d }, runningMode:'VIDEO', numFaces:1 });
+      try { landmarker = await vision.FaceLandmarker.createFromOptions(files, opts('GPU')); }
+      catch { landmarker = await vision.FaceLandmarker.createFromOptions(files, opts('CPU')); }
+    }
+    stream = await navigator.mediaDevices.getUserMedia({video:{width:640, height:480, facingMode:'user'}});
+    video.srcObject = stream; await video.play();
+    mesh.width = video.videoWidth; mesh.height = video.videoHeight;
+    running = true; neutral = null; calib = [];
+    $('camBtn').classList.add('on'); $('freezeBtn').disabled = false; $('calBtn').disabled = false; $('posesBtn').disabled = false;
+    status('looking for face…');
+  } catch (e) { status(`no camera: ${e.message}`); }
+}
+function stop(){
+  running = false; stream && stream.getTracks().forEach(t => t.stop());
+  mctx.clearRect(0, 0, mesh.width, mesh.height);
+  $('camBtn').classList.remove('on'); $('freezeBtn').disabled = true; $('calBtn').disabled = true; $('posesBtn').disabled = true;
+  status('');
+}
+
+function loop(){
+  if (running && video.readyState >= 2 && video.currentTime !== lastT){
+    lastT = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    mctx.clearRect(0, 0, mesh.width, mesh.height);
+    if (res.faceLandmarks && res.faceLandmarks.length){
+      const lm = res.faceLandmarks[0];
+      mctx.fillStyle = '#fff';
+      for (const p of lm) mctx.fillRect(p.x * mesh.width - 1, p.y * mesh.height - 1, 2, 2);
+      update(normalize(lm, video.videoWidth, video.videoHeight));
+    }
+  }
+  if (dirty){ dirty = false; draw(); }
+  requestAnimationFrame(loop);
+}
+
+/* ---------- STEP 6: your own font file (A–Z) ----------
+   For each letter A–Z:
+   1. take Archivo Black's real vector outline (read with opentype.js),
+   2. walk along the outline and start a line every few units, exactly like on screen,
+   3. push each line's tip with your face (resting shape + expression, same wiring as on screen),
+   4. turn every line, and the outline itself, into a thin filled shape (fonts can only fill shapes),
+   5. write everything into a TrueType (.ttf) file. */
+const OTJS_URL = 'https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/dist/opentype.min.js';
+const BASE_URLS = [
+  'https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/archivoblack/ArchivoBlack-Regular.ttf',
+  'https://raw.githubusercontent.com/google/fonts/main/ofl/archivoblack/ArchivoBlack-Regular.ttf',
+];
+let baseFont = null;
+function loadScript(src){
+  return new Promise((res, rej) => { const el = document.createElement('script'); el.src = src; el.onload = res; el.onerror = () => rej(new Error('could not load ' + src)); document.head.appendChild(el); });
+}
+async function getBase(){
+  if (baseFont) return baseFont;
+  if (!window.opentype) await loadScript(OTJS_URL);
+  for (const u of BASE_URLS){
+    try { const r = await fetch(u); if (r.ok){ baseFont = window.opentype.parse(await r.arrayBuffer()); return baseFont; } } catch {}
+  }
+  throw new Error('could not download Archivo Black');
+}
+
+// the glyph's outline as closed polylines, in font units (y up)
+function contoursOf(glyph){
+  const out = []; let cur = null, px = 0, py = 0;
+  for (const c of glyph.path.commands){
+    if (c.type === 'M'){ cur = [[c.x, c.y]]; out.push(cur); }
+    else if (c.type === 'L') cur.push([c.x, c.y]);
+    else if (c.type === 'Q') for (let k = 1; k <= 8; k++){ const t = k / 8, u = 1 - t; cur.push([u*u*px + 2*u*t*c.x1 + t*t*c.x, u*u*py + 2*u*t*c.y1 + t*t*c.y]); }
+    else if (c.type === 'C') for (let k = 1; k <= 10; k++){ const t = k / 10, u = 1 - t; cur.push([u*u*u*px + 3*u*u*t*c.x1 + 3*u*t*t*c.x2 + t*t*t*c.x, u*u*u*py + 3*u*u*t*c.y1 + 3*u*t*t*c.y2 + t*t*t*c.y]); }
+    if (c.type !== 'Z'){ px = c.x; py = c.y; }
+  }
+  return out.map(c => { const l = c[c.length - 1]; if (c.length > 1 && Math.hypot(l[0] - c[0][0], l[1] - c[0][1]) < 0.01) c.pop(); return c; }).filter(c => c.length > 2);
+}
+// evenly spaced points along a closed polyline
+function resample(c, sp){
+  const out = []; let carry = 0;
+  for (let k = 0; k < c.length; k++){
+    const a = c[k], b = c[(k + 1) % c.length], len = Math.hypot(b[0] - a[0], b[1] - a[1]);
+    for (let d = carry; d < len; d += sp){ const t = d / len; out.push([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]); }
+    carry = ((carry - len) % sp + sp) % sp;
+  }
+  return out;
+}
+// a straight stroke from a to b, w units wide, as a clockwise 4-point contour (integers)
+function quad(a, b, w){
+  const dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy);
+  if (len < 1) return null;
+  const nx = -dy / len * w / 2, ny = dx / len * w / 2;
+  let q = [[a[0] + nx, a[1] + ny], [b[0] + nx, b[1] + ny], [b[0] - nx, b[1] - ny], [a[0] - nx, a[1] - ny]].map(p => [Math.round(p[0]), Math.round(p[1])]);
+  let area = 0; for (let k = 0; k < 4; k++){ const p = q[k], r = q[(k + 1) % 4]; area += p[0] * r[1] - r[0] * p[1]; }
+  if (area === 0) return null;
+  if (area > 0) q = q.reverse();   // TrueType outer contours run clockwise
+  return q;
+}
+
+/* How the font imitates the screen:
+   - on screen, thousands of see-through lines overlap into soft tones. A font is one solid colour,
+     so instead every line is hair-thin and packed closely: when an app draws the letter they blend
+     into grey tones. Lines the screen would draw brighter are drawn a little thicker here.
+   - the ends of the lines are joined into a thin second edge, with small dots, like on screen.
+   - the font is built at 2× resolution (2000 units per em) so hair-thin lines stay exact. */
+const U = 2;
+function glyphShapes(base, ch, li, capH){
+  const g = base.charToGlyph(ch), cs = contoursOf(g);
+  if (!cs.length) return {contours: [], advance: (g.advanceWidth || 500) * U};
+  let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  cs.forEach(c => c.forEach(([x, y]) => { x0 = Math.min(x0, x); x1 = Math.max(x1, x); y0 = Math.min(y0, y); y1 = Math.max(y1, y); }));
+  const cx = g.advanceWidth / 2, cy = capH / 2;     // same centre rule as the screen
+  const field = fieldFor(turnsFor(li)), SC = 420 / capH, lim = capH * 0.9, dep = S.base * capH / 60, Lr = REST.light * D2R;
+  const shapes = [], add = (a, b, w) => { const q = quad([a[0]*U, a[1]*U], [b[0]*U, b[1]*U], w * U); if (q) shapes.push(q); };
+  for (const c of cs){
+    // the letter's own outline, crisp
+    ribbon(resample(c, 5), 3.5, true).forEach(r => shapes.push(r));                      // the letter itself: one smooth, continuous thin outline
+    // one line every 3 units along the outline
+    const pts = resample(c, 3), tips = [];             // one line every 3 units
+    for (let k = 0; k < pts.length; k++){
+      const [x, y] = pts[k], prev = pts[(k - 1 + pts.length) % pts.length], next = pts[(k + 1) % pts.length];
+      const tx = next[0] - prev[0], ty = next[1] - prev[1], tl = Math.hypot(tx, ty) || 1;
+      const nxs = -ty / tl, nys = -tx / tl;                                                  // outward normal, in screen orientation (y down)
+      const turn = (Math.atan2(-(y - cy), x - cx) / (Math.PI * 2) + 1.25) % 1;              // 0 = top, clockwise
+      const ang = (S.angle + REST.twist * Math.sin((capH - y) * SC * 0.017 + x * SC * 0.008)) * D2R;
+      const f = turn * BINS, b0 = Math.floor(f) % BINS, b1 = (b0 + 1) % BINS, t = f - Math.floor(f);
+      const mx = Math.max(-lim, Math.min(lim, (field[b0*2] * (1-t) + field[b1*2] * t) * capH));
+      const my = Math.max(-lim, Math.min(lim, (field[b0*2+1] * (1-t) + field[b1*2+1] * t) * capH));
+      const tip = [x + Math.sin(ang) * dep + mx, y + Math.cos(ang) * dep - my];          // face uses y down, fonts use y up
+      // same fake light as the screen → thicker where the screen is brighter
+      const hsh = Math.abs(Math.sin(x * 12.9898 + y * 78.233) * 43758.5453) % 1, na = Math.atan2(nys, nxs);
+      const v = Math.max(0, Math.min(1, 0.5 + 0.3*Math.cos(2*(na - Lr)) + 0.16*Math.cos(5*(na - Lr) + ang*3) + (hsh - 0.5)*0.26));
+      add([x, y], tip, 0.35 + 1.05 * v * v);                                              // hair-thin; brighter = slightly thicker
+      tips.push(tip);
+    }
+    // the edge made by the line ends: split where the tips spread apart (no bridging across gaps),
+    // smooth each run into a soft curve and draw it as one continuous shape
+    let run = [];
+    const flush = () => { if (run.length >= 5) ribbon(smoothRun(run), 1, false).forEach(r => shapes.push(r)); run = []; };
+    for (let k = 0; k < tips.length; k++){
+      if (run.length && Math.hypot(tips[k][0] - run[run.length - 1][0], tips[k][1] - run[run.length - 1][1]) > 22) flush();
+      run.push(tips[k]);
+      if (k % 15 === 0) shapes.push(dot(tips[k], 2.6));                                  // round dots
+    }
+    flush();
+  }
+  return {contours: shapes, advance: (g.advanceWidth + 120) * U};   // extra room for lines that reach past the letter
+}
+
+/* ---- smooth shapes for the font ---- */
+// soften a run of tip points: a short moving average removes jitter, two rounds of corner cutting
+// (Chaikin) turn the remaining corners into curves, then points closer than 2.5 units are dropped
+function smoothRun(pts){
+  let p = pts.map((_, i) => { let x = 0, y = 0, n = 0; for (let j = Math.max(0, i - 2); j <= Math.min(pts.length - 1, i + 2); j++){ x += pts[j][0]; y += pts[j][1]; n++; } return [x / n, y / n]; });
+  for (let it = 0; it < 2; it++){
+    const q = [p[0]];
+    for (let i = 0; i < p.length - 1; i++){ const a = p[i], b = p[i + 1]; q.push([a[0] * .75 + b[0] * .25, a[1] * .75 + b[1] * .25], [a[0] * .25 + b[0] * .75, a[1] * .25 + b[1] * .75]); }
+    q.push(p[p.length - 1]); p = q;
+  }
+  const out = [p[0]];
+  for (const pt of p) if (Math.hypot(pt[0] - out[out.length - 1][0], pt[1] - out[out.length - 1][1]) > 2.5) out.push(pt);
+  if (out[out.length - 1] !== p[p.length - 1]) out.push(p[p.length - 1]);
+  return out;
+}
+// a polyline turned into one continuous band w units wide (no joins, no notches when zoomed in).
+// open → one contour; closed → an outer and an inner ring (the inner one runs the other way, making a hole)
+function ribbon(pts, w, closed){
+  const n = pts.length; if (n < 2) return [];
+  const L = [], R = [];
+  for (let i = 0; i < n; i++){
+    const a = pts[closed ? (i - 1 + n) % n : Math.max(0, i - 1)], b = pts[closed ? (i + 1) % n : Math.min(n - 1, i + 1)];
+    const tx = b[0] - a[0], ty = b[1] - a[1], tl = Math.hypot(tx, ty) || 1, nx = -ty / tl * w / 2, ny = tx / tl * w / 2;
+    L.push([pts[i][0] + nx, pts[i][1] + ny]); R.push([pts[i][0] - nx, pts[i][1] - ny]);
+  }
+  const toInt = c => { const o = []; for (const p of c){ const q = [Math.round(p[0] * U), Math.round(p[1] * U)]; const l = o[o.length - 1]; if (!l || l[0] !== q[0] || l[1] !== q[1]) o.push(q); } return o; };
+  const area = c => { let s = 0; for (let i = 0; i < c.length; i++){ const p = c[i], q = c[(i + 1) % c.length]; s += p[0] * q[1] - q[0] * p[1]; } return s / 2; };
+  const orient = (c, cw) => (area(c) > 0) === cw ? c.slice().reverse() : c;   // clockwise = negative area in y-up
+  if (!closed){ const c = toInt([...L, ...R.reverse()]); return c.length > 2 && area(c) !== 0 ? [orient(c, true)] : []; }
+  let A = toInt(L), B = toInt(R);
+  if (Math.abs(area(A)) < Math.abs(area(B))) [A, B] = [B, A];                       // A = the bigger ring
+  return [orient(A, true), orient(B, false)].filter(c => c.length > 2);
+}
+// a small round dot
+function dot(p, r){
+  const c = []; for (let k = 0; k < 10; k++){ const a = -k / 10 * Math.PI * 2; c.push([Math.round((p[0] + Math.cos(a) * r) * U), Math.round((p[1] + Math.sin(a) * r) * U)]); }
+  return c;   // angles go clockwise
+}
+
+/* ---- variable font ----
+   A variable font stores one full version of every letter (the "default") plus, for each axis,
+   how far every single point moves to reach the other end of that axis. Apps blend in between.
+   For that to work every version must have exactly the same shapes and points in the same order,
+   so this builder never skips, merges or reorders anything that depends on the face.
+
+   Axes:  Face        0 = the reference face   … 100 = your face shape        (default 100)
+          Expression  0 = your resting face    … 100 = your frozen expression (default 100)
+   Because every line tip is   rest + face shape × f + expression × e,   blending is exact. */
+const VAR_SPACING = 5;     // a line every 5 units (fewer than the static font, keeps the file manageable)
+
+function quadFixed(a, b, w){                     // like quad(), but never dropped or flipped
+  let dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy);
+  if (len < 1e-6){ dx = 0; dy = 1; len = 1; }    // a zero-length line still gets a (tiny, upright) shape
+  const nx = -dy / len * w / 2, ny = dx / len * w / 2;
+  return [[a[0] + nx, a[1] + ny], [b[0] + nx, b[1] + ny], [b[0] - nx, b[1] - ny], [a[0] - nx, a[1] - ny]];   // always clockwise
+}
+function smoothFixed(pts){                       // smoothRun() without dropping points
+  let p = pts.map((_, i) => { let x = 0, y = 0, n = 0; for (let j = Math.max(0, i - 2); j <= Math.min(pts.length - 1, i + 2); j++){ x += pts[j][0]; y += pts[j][1]; n++; } return [x / n, y / n]; });
+  const q = [p[0]];
+  for (let i = 0; i < p.length - 1; i++){ const a = p[i], b = p[i + 1]; q.push([a[0] * .75 + b[0] * .25, a[1] * .75 + b[1] * .25], [a[0] * .25 + b[0] * .75, a[1] * .25 + b[1] * .75]); }
+  q.push(p[p.length - 1]);
+  return q;
+}
+function ribbonFixed(pts, w){                    // open band, always the same number of points
+  const n = pts.length, L = [], R = [];
+  for (let i = 0; i < n; i++){
+    const a = pts[Math.max(0, i - 1)], b = pts[Math.min(n - 1, i + 1)];
+    let tx = b[0] - a[0], ty = b[1] - a[1], tl = Math.hypot(tx, ty); if (tl < 1e-6){ tx = 1; ty = 0; tl = 1; }
+    const nx = -ty / tl * w / 2, ny = tx / tl * w / 2;
+    L.push([pts[i][0] + nx, pts[i][1] + ny]); R.push([pts[i][0] - nx, pts[i][1] - ny]);
+  }
+  return [...L, ...R.reverse()];
+}
+const toUnits = c => c.map(p => [Math.round(p[0] * U), Math.round(p[1] * U)]);
+
+/* ---- recorded poses ----
+   After the relaxed face is known, "record poses" asks for each movement in turn.
+   Each pose is stored as how far every face point moved from the relaxed face. */
+const POSES = [['mouth', 'open your mouth'], ['smile', 'smile'], ['brows', 'raise your eyebrows'],
+               ['lookL', 'look left\n(eyes only)'], ['lookR', 'look right\n(eyes only)']];
+const poses = {};
+let poseRec = null;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const prompt = t => { $('prompt').textContent = t; };
+async function recordPoses(){
+  if (!neutral){ status('hold a relaxed face first'); return; }
+  $('posesBtn').disabled = true;
+  for (const [key, say] of POSES){
+    for (let c = 3; c > 0; c--){ prompt(`${say}\n${c}`); await sleep(800); }
+    prompt(`${say}\nhold…`); poseRec = [];
+    const t0 = performance.now();
+    while (poseRec.length < 25 && performance.now() - t0 < 6000) await sleep(30);
+    const frames = poseRec; poseRec = null;
+    if (frames.length < 8){ prompt(`no face found\nskipping`); await sleep(900); continue; }
+    const d = new Float32Array(N * 2);
+    for (const f of frames) for (let j = 0; j < N * 2; j++) d[j] += (f[j] - neutral[j]) / frames.length;
+    poses[key] = d; prompt('✓'); await sleep(500);
+  }
+  prompt(''); status(`poses recorded: ${Object.keys(poses).length} of ${POSES.length}`);
+  $('posesBtn').disabled = false;
+}
+
+/* ---- building blocks for the variable font ----
+   glyphBase:  everything about a letter that never changes (outline, line starts, line widths)
+   tipsFor:    where every line ends for one given push of the face points
+   shapesFor:  turns starts + ends into the letter's shapes, always with the same structure */
+function glyphBase(base, ch, capH){
+  const g = base.charToGlyph(ch), cs = contoursOf(g);
+  const cx = g.advanceWidth / 2, cy = capH / 2, SC = 420 / capH, Lr = REST.light * D2R;
+  const contours = cs.map(c => {
+    const ring = ribbon(resample(c, 5), 3.5, true);
+    const pts = resample(c, VAR_SPACING);
+    const P = pts.map(([x, y], k) => {
+      const prev = pts[(k - 1 + pts.length) % pts.length], next = pts[(k + 1) % pts.length];
+      const tx = next[0] - prev[0], ty = next[1] - prev[1], tl = Math.hypot(tx, ty) || 1, nxs = -ty / tl, nys = -tx / tl;
+      const ang = (S.angle + REST.twist * Math.sin((capH - y) * SC * 0.017 + x * SC * 0.008)) * D2R;
+      const hsh = Math.abs(Math.sin(x * 12.9898 + y * 78.233) * 43758.5453) % 1, na = Math.atan2(nys, nxs);
+      const v = Math.max(0, Math.min(1, 0.5 + 0.3*Math.cos(2*(na - Lr)) + 0.16*Math.cos(5*(na - Lr) + ang*3) + (hsh - 0.5)*0.26));
+      return {x, y, ang, w: 0.35 + 1.05 * v * v, turn: (Math.atan2(-(y - cy), x - cx) / (Math.PI * 2) + 1.25) % 1};
+    });
+    return {ring, P};
+  });
+  return {contours, advance: ((g.advanceWidth || 500) + (cs.length ? 120 : 0)) * U, empty: !cs.length};
+}
+function tipsFor(gb, li, capH, vec){
+  const field = fieldFor(turnsFor(li), 1, 1, vec), lim = capH * 0.9, dep = S.base * capH / 60;
+  return gb.contours.map(({P}) => P.map(({x, y, ang, turn}) => {
+    const f = turn * BINS, b0 = Math.floor(f) % BINS, b1 = (b0 + 1) % BINS, t = f - Math.floor(f);
+    const mx = Math.max(-lim, Math.min(lim, (field[b0*2] * (1-t) + field[b1*2] * t) * capH));
+    const my = Math.max(-lim, Math.min(lim, (field[b0*2+1] * (1-t) + field[b1*2+1] * t) * capH));
+    return [x + Math.sin(ang) * dep + mx, y + Math.cos(ang) * dep - my];
+  }));
+}
+// where to split the line-end edges: wherever ANY version spreads apart, so no version bridges a gap
+function runsFor(allTips){
+  return allTips[0].map((tips, ci) => {
+    const brk = new Set();
+    for (const T of allTips) for (let k = 1; k < T[ci].length; k++) if (Math.hypot(T[ci][k][0] - T[ci][k-1][0], T[ci][k][1] - T[ci][k-1][1]) > 22) brk.add(k);
+    const runs = []; let start = 0;
+    for (let k = 1; k <= tips.length; k++) if (k === tips.length || brk.has(k)){ if (k - start >= 5) runs.push([start, k]); start = k; }
+    return runs;
+  });
+}
+function shapesFor(gb, tips, runs){
+  const shapes = [];
+  gb.contours.forEach(({ring, P}, ci) => {
+    ring.forEach(r => shapes.push(r));
+    P.forEach((p, k) => shapes.push(toUnits(quadFixed([p.x, p.y], tips[ci][k], p.w))));
+    runs[ci].forEach(([s0, s1]) => shapes.push(toUnits(ribbonFixed(smoothFixed(tips[ci].slice(s0, s1)), 1))));
+    for (let k = 0; k < tips[ci].length; k += 15) shapes.push(dot(tips[ci][k], 2.6));
+  });
+  return shapes;
+}
+
+/* fvar: the axes and the named styles */
+function fvarTable(v){
+  const A = v.axes.length, fx = x => Math.round(x * 65536);
+  const b = new Bytes().u16(1).u16(0).u16(16).u16(2).u16(A).u16(20).u16(v.instances.length).u16(4 + 4 * A);
+  v.axes.forEach((ax, i) => b.tag(ax.tag).u32(fx(ax.min) >>> 0).u32(fx(ax.def) >>> 0).u32(fx(ax.max) >>> 0).u16(0).u16(256 + i));
+  v.instances.forEach(ins => { b.u16(ins.nameID).u16(0); ins.coords.forEach(c => b.u32(fx(c) >>> 0)); });
+  return b.out();
+}
+/* STAT: describes the axes for apps' style menus */
+function statTable(v){
+  const b = new Bytes().u16(1).u16(1).u16(8).u16(v.axes.length).u32(20).u16(0).u32(0).u16(2);
+  v.axes.forEach((ax, i) => b.tag(ax.tag).u16(256 + i).u16(i));
+  return b.out();
+}
+/* packed point deltas: runs of zeros, of small numbers (1 byte) or of large numbers (2 bytes) */
+function packDeltas(d, out){
+  let i = 0;
+  while (i < d.length){
+    if (d[i] === 0){ let n = 0; while (i + n < d.length && d[i + n] === 0 && n < 64) n++; out.u8(0x80 | (n - 1)); i += n; }
+    else if (Math.abs(d[i]) <= 127){ let n = 0; while (i + n < d.length && d[i + n] !== 0 && Math.abs(d[i + n]) <= 127 && n < 64) n++; out.u8(n - 1); for (let k = 0; k < n; k++) out.u8(d[i + k] & 255); i += n; }
+    else { let n = 0; while (i + n < d.length && Math.abs(d[i + n]) > 127 && n < 64) n++; out.u8(0x40 | (n - 1)); for (let k = 0; k < n; k++) out.i16(d[i + k]); i += n; }
+  }
+}
+/* gvar: for every letter and every axis, how far each point moves at the far end of that axis */
+function gvarTable(v, glyphCount){
+  const A = v.axes.length, shared = v.peaks;                       // peaks: one tuple per axis, e.g. [[-1,0],[0,-1]]
+  const f2 = x => Math.round(x * 16384) & 0xFFFF;
+  const tuples = new Bytes(); shared.forEach(t => t.forEach(c => tuples.u16(f2(c))));
+  const datas = [];
+  for (let gi = 0; gi < glyphCount; gi++){
+    const gv = v.glyphs[gi];
+    if (!gv || !gv.deltas.length){ datas.push(new Uint8Array(0)); continue; }
+    const bodies = gv.deltas.map(dl => { const b = new Bytes(); packDeltas(dl.x, b); packDeltas(dl.y, b); return b; });
+    const hdr = new Bytes().u16(0x8000 | bodies.length).u16(4 + bodies.length * 4);
+    bodies.forEach((bd, k) => hdr.u16(bd.length).u16(gv.deltas[k].tuple));
+    hdr.u8(0);                                                     // shared point numbers: "all points"
+    bodies.forEach(bd => hdr.bytes(bd.a));
+    if (hdr.length % 2) hdr.u8(0);
+    datas.push(hdr.out());
+  }
+  const head = 20 + 4 * (glyphCount + 1), sharedOff = head, dataOff = head + tuples.length;
+  const b = new Bytes().u16(1).u16(0).u16(A).u16(shared.length).u32(sharedOff).u16(glyphCount).u16(1).u32(dataOff);
+  let off = 0; datas.forEach(d => { b.u32(off); off += d.length; }); b.u32(off);
+  b.bytes(tuples.a); datas.forEach(d => b.bytes(d));
+  return b.out();
+}
+
+async function makeVariableFont(){
+  if (!neutral) throw new Error('hold a relaxed face first');
+  const base = await getBase();
+  const upm = base.unitsPerEm, os2 = base.tables.os2 || {}, capH = os2.sCapHeight || 688, xH = os2.sxHeight || 528;
+  const NN = N * 2, vec = () => new Float32Array(NN);
+  // face shape split down the middle (x < 0 is the person's own left side after mirroring; the midline counts half to each)
+  const shapeL = vec(), shapeR = vec();
+  for (let i = 0; i < N; i++){
+    const x = neutral[i*2], wl = x < -0.02 ? 1 : x > 0.02 ? 0 : 0.5;
+    for (const j of [i*2, i*2+1]){ shapeL[j] = shape[j] * S.shape * wl; shapeR[j] = shape[j] * S.shape * (1 - wl); }
+  }
+  const def = vec(); for (let j = 0; j < NN; j++) def[j] = shapeL[j] + shapeR[j];       // default: your resting face
+  const plus = (v, k) => { const o = Float32Array.from(def); for (let j = 0; j < NN; j++) o[j] += v[j] * k; return o; };
+
+  // axes, and for each axis the version of the face at its far end
+  const axes = [], variants = [];
+  const addAxis = (tag, name, min, d, max) => { axes.push({tag, name, min, def: d, max}); return axes.length - 1; };
+  const LOOK_BOOST = 2.5;                                                               // eye movements are small; make them visible
+  if (poses.mouth){ const a = addAxis('MOUT', 'Mouth open', 0, 0, 100); variants.push({a, peak: 1, v: plus(poses.mouth, S.gain), label: 'Mouth Open'}); }
+  if (poses.smile){ const a = addAxis('SMIL', 'Smile', 0, 0, 100); variants.push({a, peak: 1, v: plus(poses.smile, S.gain), label: 'Smile'}); }
+  if (poses.brows){ const a = addAxis('BROW', 'Brows', 0, 0, 100); variants.push({a, peak: 1, v: plus(poses.brows, S.gain), label: 'Brows Up'}); }
+  if (poses.lookL || poses.lookR){
+    const a = addAxis('LOOK', 'Look', -100, 0, 100);
+    if (poses.lookL) variants.push({a, peak: -1, v: plus(poses.lookL, S.gain * LOOK_BOOST), label: 'Look Left'});
+    if (poses.lookR) variants.push({a, peak: 1, v: plus(poses.lookR, S.gain * LOOK_BOOST), label: 'Look Right'});
+  }
+  const aL = addAxis('LHLF', 'Left half', 0, 100, 100); variants.push({a: aL, peak: -1, v: plus(shapeL, -1)});
+  const aR = addAxis('RHLF', 'Right half', 0, 100, 100); variants.push({a: aR, peak: -1, v: plus(shapeR, -1)});
+  const peaks = variants.map(vr => axes.map((_, i) => i === vr.a ? vr.peak : 0));
+
+  // every letter: the default version + how each point moves for every variant
+  const flat = cs => { const p = []; cs.forEach(c => c.forEach(q => p.push(q))); return p; };
+  const glyphs = [{contours: [], advance: 500 * U}, {contours: [], advance: (base.charToGlyph(' ').advanceWidth || 333) * U}], gv = [null, null];
+  const chars = [];
+  for (let li = 0; li < 26; li++) chars.push([String.fromCharCode(65 + li), li]);
+  for (let li = 0; li < 26; li++) chars.push([String.fromCharCode(97 + li), li]);
+  for (const [ch, li] of chars){
+    const gb = glyphBase(base, ch, capH);
+    if (gb.empty){ glyphs.push({contours: [], advance: gb.advance}); gv.push({deltas: []}); continue; }
+    const tDef = tipsFor(gb, li, capH, def), tVar = variants.map(vr => tipsFor(gb, li, capH, vr.v));
+    const runs = runsFor([tDef, ...tVar]);
+    const P = flat(shapesFor(gb, tDef, runs)), deltas = [];
+    tVar.forEach((tv, k) => {
+      const Q = flat(shapesFor(gb, tv, runs));
+      if (Q.length !== P.length) throw new Error(`letter ${ch} changed structure between versions`);
+      const x = P.map((p, i) => Q[i][0] - p[0]).concat([0, 0, 0, 0]), y = P.map((p, i) => Q[i][1] - p[1]).concat([0, 0, 0, 0]);   // + 4 phantom points
+      if (x.some(d => d) || y.some(d => d)) deltas.push({tuple: k, x, y});
+    });
+    glyphs.push({contours: shapesFor(gb, tDef, runs), advance: gb.advance}); gv.push({deltas});
+  }
+
+  // named styles: the default, each recorded pose, and no face shape
+  const at = changes => axes.map((ax, i) => (i in changes) ? changes[i] : ax.def);
+  const instances = [{nameID: 2, coords: at({})}];
+  variants.filter(vr => vr.label).forEach(vr => instances.push({name: vr.label, coords: at({[vr.a]: vr.peak > 0 ? axes[vr.a].max : axes[vr.a].min})}));
+  instances.push({name: 'Reference', coords: at({[aL]: 0, [aR]: 0})});
+  instances.forEach((ins, i) => { if (!ins.nameID) ins.nameID = 256 + axes.length + i; });
+
+  const fam = ($('fontName').value || 'Reflect Face').trim().replace(/[^\w \-]/g, '').slice(0, 28) || 'Reflect Face';
+  const family = fam + ' Variable';
+  return {...writeTTF({family, glyphs, upm: upm * U, asc: (base.ascender || 878) * U, desc: (base.descender || -210) * U, capH: capH * U, xH: xH * U,
+                       variable: {axes, instances, peaks, glyphs: gv}}), family};
+}
+
+/* ---- a minimal TrueType writer ---- */
+class Bytes {
+  constructor(){ this.a = []; }
+  u8(v){ this.a.push(v & 255); return this; }
+  u16(v){ return this.u8(v >> 8).u8(v); }
+  i16(v){ return this.u16(v < 0 ? v + 65536 : v); }
+  u32(v){ return this.u16(Math.floor(v / 65536) & 65535).u16(v & 65535); }
+  tag(s){ for (const ch of s) this.u8(ch.charCodeAt(0)); return this; }
+  bytes(b){ for (const v of b) this.a.push(v); return this; }
+  pad(){ while (this.a.length % 4) this.a.push(0); return this; }
+  get length(){ return this.a.length; }
+  out(){ return Uint8Array.from(this.a); }
+}
+function checksum(u8){
+  let sum = 0;
+  for (let i = 0; i < u8.length; i += 4) sum = (sum + ((u8[i] << 24) | ((u8[i+1] || 0) << 16) | ((u8[i+2] || 0) << 8) | (u8[i+3] || 0))) >>> 0;
+  return sum;
+}
+function encodeGlyph(contours){
+  if (!contours.length) return {data: new Uint8Array(0), xMin:0, yMin:0, xMax:0, yMax:0, points:0};
+  let xMin = Infinity, yMin = Infinity, xMax = -Infinity, yMax = -Infinity, n = 0;
+  contours.forEach(c => c.forEach(([x, y]) => { xMin = Math.min(xMin, x); yMin = Math.min(yMin, y); xMax = Math.max(xMax, x); yMax = Math.max(yMax, y); n++; }));
+  const b = new Bytes().i16(contours.length).i16(xMin).i16(yMin).i16(xMax).i16(yMax);
+  let end = -1; contours.forEach(c => { end += c.length; b.u16(end); });
+  b.u16(0);                                            // no hinting instructions
+  const flags = [], xs = new Bytes(), ys = new Bytes();
+  let px = 0, py = 0;
+  contours.forEach(c => c.forEach(([x, y]) => {
+    let f = 1;                                         // on-curve point
+    const dx = x - px, dy = y - py; px = x; py = y;
+    if (dx === 0) f |= 0x10; else if (Math.abs(dx) < 256){ f |= 0x02 | (dx > 0 ? 0x10 : 0); xs.u8(Math.abs(dx)); } else xs.i16(dx);
+    if (dy === 0) f |= 0x20; else if (Math.abs(dy) < 256){ f |= 0x04 | (dy > 0 ? 0x20 : 0); ys.u8(Math.abs(dy)); } else ys.i16(dy);
+    flags.push(f);
+  }));
+  b.bytes(flags).bytes(xs.a).bytes(ys.a).pad();
+  return {data: b.out(), xMin, yMin, xMax, yMax, points: n};
+}
+function nameTable(names){
+  const recs = Object.entries(names).map(([id, str]) => { const u = []; for (const ch of str){ const c = ch.charCodeAt(0); u.push(c >> 8, c & 255); } return [+id, u]; });
+  const b = new Bytes().u16(0).u16(recs.length).u16(6 + recs.length * 12);
+  let off = 0; recs.forEach(([id, u]) => { b.u16(3).u16(1).u16(0x0409).u16(id).u16(u.length).u16(off); off += u.length; });
+  recs.forEach(([, u]) => b.bytes(u));
+  return b.out();
+}
+function writeTTF({family, glyphs, upm, asc, desc, capH, xH, variable}){
+  const enc = glyphs.map(g => ({...encodeGlyph(g.contours), advance: g.advance, contours: g.contours.length}));
+  const inked = enc.filter(e => e.points);
+  const X0 = Math.min(...inked.map(e => e.xMin)), Y0 = Math.min(...inked.map(e => e.yMin));
+  const X1 = Math.max(...inked.map(e => e.xMax)), Y1 = Math.max(...inked.map(e => e.yMax));
+  const ps = (family.replace(/[^A-Za-z0-9]/g, '') || 'ReflectFace') + '-Regular';
+  const now = Math.floor(Date.now() / 1000) + 2082844800;   // seconds since 1904
+  const T = {};
+  T['head'] = new Bytes().u32(0x00010000).u32(0x00010000).u32(0).u32(0x5F0F3CF5).u16(0x000B).u16(upm)
+    .u32(0).u32(now).u32(0).u32(now).i16(X0).i16(Y0).i16(X1).i16(Y1).u16(0).u16(8).i16(2).i16(1).i16(0).out();
+  T['hhea'] = new Bytes().u32(0x00010000).i16(asc).i16(desc).i16(0).u16(Math.max(...enc.map(e => e.advance)))
+    .i16(Math.min(...inked.map(e => e.xMin))).i16(Math.min(...inked.map(e => e.advance - e.xMax))).i16(X1)
+    .i16(1).i16(0).i16(0).i16(0).i16(0).i16(0).i16(0).i16(0).u16(enc.length).out();
+  T['maxp'] = new Bytes().u32(0x00010000).u16(enc.length).u16(Math.max(...enc.map(e => e.points))).u16(Math.max(...enc.map(e => e.contours)))
+    .u16(0).u16(0).u16(2).u16(0).u16(0).u16(0).u16(0).u16(0).u16(0).u16(0).u16(0).out();
+  const avg = Math.round(enc.filter(e => e.advance).reduce((s, e) => s + e.advance, 0) / enc.filter(e => e.advance).length);
+  T['OS/2'] = new Bytes().u16(4).i16(avg).u16(400).u16(5).u16(0)
+    .i16(650).i16(600).i16(0).i16(75).i16(650).i16(600).i16(0).i16(350).i16(50).i16(300).i16(0)
+    .bytes(new Array(10).fill(0)).u32(1).u32(0).u32(0).u32(0).tag('NONE').u16(0x00C0).u16(0x20).u16(0x7A)
+    .i16(asc).i16(desc).i16(0).u16(Math.max(asc, Y1)).u16(Math.max(-desc, -Y0)).u32(1).u32(0)
+    .i16(xH).i16(capH).u16(0).u16(32).u16(1).out();
+  // cmap: space, A–Z, a–z
+  const segs = [[32, 32, 1 - 32], [65, 90, 2 - 65], [97, 122, 28 - 97], [0xFFFF, 0xFFFF, 1]];
+  const sub = new Bytes().u16(4).u16(16 + segs.length * 8).u16(0).u16(segs.length * 2).u16(8).u16(2).u16(segs.length * 2 - 8);
+  segs.forEach(s => sub.u16(s[1])); sub.u16(0); segs.forEach(s => sub.u16(s[0])); segs.forEach(s => sub.i16(s[2] > 32767 ? s[2] - 65536 : s[2])); segs.forEach(() => sub.u16(0));
+  T['cmap'] = new Bytes().u16(0).u16(2).u16(0).u16(3).u32(20).u16(3).u16(1).u32(20).bytes(sub.a).out();
+  const glyf = new Bytes(), loca = new Bytes();
+  enc.forEach(e => { loca.u32(glyf.length); glyf.bytes(e.data); }); loca.u32(glyf.length);
+  T['glyf'] = glyf.out(); T['loca'] = loca.out();
+  const hmtx = new Bytes(); enc.forEach(e => hmtx.u16(e.advance).i16(e.points ? e.xMin : 0)); T['hmtx'] = hmtx.out();
+  const names = {
+    0: 'Built on Archivo Black, Copyright 2017 The Archivo Black Project Authors (https://github.com/Omnibus-Type/ArchivoBlack). Shaped by a face with MediaPipe Face Landmarker.',
+    1: family, 2: 'Regular', 3: ps + ';' + new Date().toISOString().slice(0, 10), 4: family + ' Regular', 5: 'Version 1.000', 6: ps,
+    13: 'This Font Software is licensed under the SIL Open Font License, Version 1.1.', 14: 'https://openfontlicense.org',
+  };
+  if (variable){
+    variable.axes.forEach((ax, i) => { names[256 + i] = ax.name; });
+    variable.instances.forEach(ins => { if (ins.name) names[ins.nameID] = ins.name; });
+    T['fvar'] = fvarTable(variable);
+    T['STAT'] = statTable(variable);
+    T['gvar'] = gvarTable(variable, enc.length);
+  }
+  T['name'] = nameTable(names);
+  T['post'] = new Bytes().u32(0x00030000).u32(0).i16(-100).i16(50).u32(0).u32(0).u32(0).u32(0).u32(0).out();
+
+  const tags = Object.keys(T).sort();
+  const head = new Bytes().u32(0x00010000).u16(tags.length).u16(128).u16(3).u16(tags.length * 16 - 128);
+  let off = 12 + tags.length * 16;
+  const bodies = new Bytes();
+  tags.forEach(tag => { head.tag(tag).u32(checksum(T[tag])).u32(off).u32(T[tag].length); bodies.bytes(T[tag]).pad(); off = 12 + tags.length * 16 + bodies.length; });
+  const file = new Uint8Array([...head.a, ...bodies.a]);
+  // head.checkSumAdjustment = 0xB1B0AFBA − checksum of the whole file
+  const adj = (0xB1B0AFBA - checksum(file)) >>> 0, at = 12 + tags.length * 16 + tags.slice(0, tags.indexOf('head')).reduce((s, t) => s + Math.ceil(T[t].length / 4) * 4, 0) + 8;
+  file[at] = adj >>> 24; file[at+1] = (adj >>> 16) & 255; file[at+2] = (adj >>> 8) & 255; file[at+3] = adj & 255;
+  return {buf: file.buffer, ps};
+}
+
+async function makeFont(){
+  const base = await getBase();
+  const upm = base.unitsPerEm, os2 = base.tables.os2 || {};
+  const capH = os2.sCapHeight || 688, xH = os2.sxHeight || 528;
+  const glyphs = [{contours: [], advance: 500 * U}, {contours: [], advance: (base.charToGlyph(' ').advanceWidth || 333) * U}];
+  for (let li = 0; li < 26; li++) glyphs.push(glyphShapes(base, String.fromCharCode(65 + li), li, capH));   // A–Z
+  for (let li = 0; li < 26; li++) glyphs.push(glyphShapes(base, String.fromCharCode(97 + li), li, capH));   // a–z, wired like their capitals
+  const family = ($('fontName').value || 'Reflect Face').trim().replace(/[^\w \-]/g, '').slice(0, 28) || 'Reflect Face';
+  return {...writeTTF({family, glyphs, upm: upm * U, asc: (base.ascender || 878) * U, desc: (base.descender || -210) * U, capH: capH * U, xH: xH * U}), family};
+}
+
+async function downloadFont(variable){
+  const btns = [$('ttfVarBtn')]; btns.forEach(b => b.disabled = true);
+  status(variable ? 'building variable font…' : 'building font…');
+  try {
+    const {buf, ps} = variable ? await makeVariableFont() : await makeFont();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([buf], {type:'font/ttf'})); a.download = `${ps}.ttf`; a.click();
+    status(`downloaded ${ps}.ttf`);
+  } catch (e) { status(`font failed: ${e.message}`); }
+  btns.forEach(b => b.disabled = false);
+}
+
+/* ---------- controls ---------- */
+$('camBtn').onclick = () => running ? stop() : start();
+$('camBtn').onkeydown = e => { if (e.key === 'Enter' || e.key === ' '){ e.preventDefault(); running ? stop() : start(); } };
+$('freezeBtn').onclick = () => { frozen = !frozen; $('freezeBtn').textContent = frozen ? 'unfreeze' : 'freeze';
+  status(frozen ? 'frozen' : 'tracking'); };
+$('calBtn').onclick = () => { neutral = null; calib = []; frozen = false; $('freezeBtn').textContent = 'freeze'; };
+$('text').oninput = e => { S.text = e.target.value; layout(); };
+$('shape').oninput = e => { S.shape = +e.target.value; $('shapeVal').textContent = `${S.shape}×`; dirty = true; };
+$('gain').oninput = e => { S.gain = +e.target.value; $('gainVal').textContent = `${S.gain}×`; dirty = true; };
+$('base').oninput = e => { S.base = +e.target.value; $('baseVal').textContent = S.base; dirty = true; };
+$('modeBtn').onclick = () => { mode = mode === 'random' ? 'matched' : 'random'; $('modeBtn').textContent = `mapping: ${mode}`; $('shuffleBtn').disabled = mode !== 'random'; buildMapping(); };
+$('shuffleBtn').onclick = () => { seed = Math.floor(Math.random() * 1e6); buildMapping(); };
+// the variable font needs your poses: if they aren't recorded yet, record them first, then download
+$('ttfVarBtn').onclick = async () => {
+  if (Object.keys(poses).length < POSES.length){
+    if (!running || !neutral){ status('start the camera and relax first: the variable font records your poses'); return; }
+    $('ttfVarBtn').disabled = true;
+    await recordPoses();
+    $('ttfVarBtn').disabled = false;
+  }
+  downloadFont(true);
+};
+$('posesBtn').onclick = recordPoses;
+$('savePng').onclick = () => { const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download = `478-${S.text}.png`; a.click(); };
+
+// testing hook: feed made-up faces through the same pipeline (no camera needed)
+window.__face478 = { _testCameraOn: () => { running = true; }, CANON, makeFont, makeVariableFont, setPose: (k, v) => { poses[k] = v; }, poses: () => Object.keys(poses), normalize, update, setNeutral, shuffle: v => { seed = v; buildMapping(); }, setMode: m => { mode = m; buildMapping(); }, get neutral(){ return neutral; } };
+
+new ResizeObserver(layout).observe(canvas);
+document.fonts && document.fonts.load(`100px ${FONT}`).then(layout);
+layout(); loop();
+</script>
+</body>
+</html>
