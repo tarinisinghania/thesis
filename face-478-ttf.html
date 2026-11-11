@@ -7,6 +7,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Archivo+Black&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box}
+[hidden]{display:none!important}
 html,body{height:100%;margin:0;background:#000;color:#fff;overflow:hidden}
 body{font:11px/1.4 "Courier New",ui-monospace,monospace}
 /* left: the camera, full height · right (bigger): the typeface above, the controls below */
@@ -18,6 +19,14 @@ body{font:11px/1.4 "Courier New",ui-monospace,monospace}
 .cam video,.cam canvas{position:absolute;inset:0;width:100%;height:100%;transform:scaleX(-1);object-fit:cover}
 .cam video{opacity:.35;filter:grayscale(1)}
 .cam span{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#fff;font-size:13px}
+.camstart{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2;background:#000;color:#fff;border:1px solid #fff;padding:14px 34px;font:inherit;font-size:15px;letter-spacing:.06em;cursor:pointer;white-space:nowrap}
+.camstart:hover{background:#fff;color:#000}
+.camstart:focus-visible{outline:1px solid #fff;outline-offset:4px}
+/* the finished font, shown on the right once it is built */
+#fontView{flex:1 1 0;min-height:0;display:flex;align-items:center;justify-content:center;overflow:hidden;padding:0 24px}
+#fv{font-family:"MyFace",sans-serif;line-height:1.1;white-space:nowrap;outline:none;color:#fff}
+.axes{grid-column:1/-1;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px 24px;border-top:1px solid #333;padding-top:14px}
+@media (max-width:1000px){ .axes{grid-template-columns:repeat(2,minmax(0,1fr))} }
 #prompt{position:absolute;left:0;right:0;bottom:12%;text-align:center;color:#fff;font-size:clamp(18px,2.4vw,30px);white-space:pre-line;text-shadow:0 0 10px #000,0 0 3px #000;pointer-events:none}
 .cam.on span{display:none}
 .controls{border-top:1px solid #fff;padding:14px 16px 16px;display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px 24px;align-items:end}
@@ -36,7 +45,7 @@ input[type=range]{display:block;width:100%;margin:4px 0 0;accent-color:#fff}
   html,body{overflow:auto}
   .split{grid-template-columns:1fr;grid-template-rows:42vh auto;height:auto}
   .left{border-right:0;border-bottom:1px solid #fff}
-  #c{flex:none;height:55vh}
+  #c,#fontView{flex:none;height:55vh}
 }
 </style>
 </head>
@@ -44,23 +53,24 @@ input[type=range]{display:block;width:100%;margin:4px 0 0;accent-color:#fff}
 <div class="split">
   <div class="left">
     <div class="cam" id="camBtn" role="button" tabindex="0" aria-label="Start or stop camera"><video id="video" playsinline muted></video><canvas id="mesh"></canvas><span>start camera</span><div id="prompt" aria-live="assertive"></div></div>
+    <button id="startBtn" class="camstart" type="button" hidden>start</button>
   </div>
   <div class="right">
     <canvas id="c" aria-label="Letters drawn by face points"></canvas>
     <div class="controls">
       <div class="group">
-        <div class="links"><button id="freezeBtn" disabled>freeze</button><button id="calBtn" disabled>reset</button><button id="posesBtn" disabled>record poses</button><button id="savePng">save</button></div>
+        <div class="links"><button id="freezeBtn" disabled>freeze</button><button id="calBtn" disabled>reset</button><button id="savePng">save</button></div>
         <div class="links"><button id="modeBtn">mapping: random</button><button id="shuffleBtn">shuffle</button></div>
         <p id="status"></p>
       </div>
       <label>word<input type="text" id="text" value="Hello" maxlength="10" spellcheck="false"></label>
       <div class="group">
         <label>font name<input type="text" id="fontName" value="Reflect Face" maxlength="28" spellcheck="false"></label>
-        <div class="links"><button id="ttfVarBtn">download variable ttf</button></div>
+        <div class="links"><button id="ttfVarBtn" disabled>download variable ttf</button></div>
       </div>
-      <label>face shape <b id="shapeVal">4×</b><input type="range" id="shape" min="0" max="12" step="0.5" value="4"></label>
-      <label>expression <b id="gainVal">3×</b><input type="range" id="gain" min="0" max="12" value="3"></label>
       <label>resting length <b id="baseVal">20</b><input type="range" id="base" min="0" max="60" value="20"></label>
+      <label>line width <b id="widthVal">1×</b><input type="range" id="width" min="0.5" max="5" step="0.25" value="1"></label>
+      <div class="axes" id="axes" hidden></div>
     </div>
   </div>
 </div>
@@ -89,7 +99,7 @@ const canvas = $('c'), ctx = canvas.getContext('2d');
 const off = document.createElement('canvas'), octx = off.getContext('2d', {willReadFrequently:true});
 const glow = document.createElement('canvas'), gctx = glow.getContext('2d');
 const FONT = '"Archivo Black", Impact, "Arial Black", sans-serif';
-const S = {text:'Hello', gain:3, shape:4, base:20, angle:0};   // angle: lines rest straight up
+const S = {text:'Hello', gain:3, shape:12, base:20, width:1, angle:0};   // shape 12 = your full face shape (100%)   // angle: lines rest straight up
 let W = 1, H = 1, dpr = 1, dirty = true;
 
 /* ---------- STEP 4 (type side): every outline pixel becomes a line ---------- */
@@ -322,7 +332,8 @@ function fieldFor(turns, ws = 1, we = 1, vec = null){   // vec: a ready-made pus
   for (let b = 0; b < BINS; b++) if (wsum[b]){ field[b*2] /= wsum[b]; field[b*2+1] /= wsum[b]; }
   return field;
 }
-function buildField(){ fields = letterTurn.map(t => fieldFor(t)); }   // (wrapped so map's extra arguments aren't passed in)
+let previewVec = null;   // once your font exists, its sliders drive the drawing instead of the camera
+function buildField(){ fields = letterTurn.map(t => previewVec ? fieldFor(t, 1, 1, previewVec) : fieldFor(t)); }   // (wrapped so map's extra arguments aren't passed in)
 const NB = 24;
 // twice as many lines as before, so each one is half as bright: the total light stays the same
 const SHADE = Array.from({length:NB}, (_, i) => `rgba(255,255,255,${(0.045 + 0.19 * i / (NB - 1)).toFixed(3)})`);
@@ -356,7 +367,7 @@ function draw(){
   markers.forEach(ml => { for (let i = 0; i < N; i++){ const j = ml[i]; if (j < 0) continue; const n = j / 7 * 2; dots.rect(tips[n] - 1, tips[n+1] - 1, 2, 2); } });
 
   gctx.setTransform(1,0,0,1,0,0); gctx.clearRect(0, 0, glow.width, glow.height);
-  gctx.setTransform(dpr,0,0,dpr,0,0); gctx.globalCompositeOperation = 'lighter'; gctx.lineWidth = 1.1;
+  gctx.setTransform(dpr,0,0,dpr,0,0); gctx.globalCompositeOperation = 'lighter'; gctx.lineWidth = 1.1 * S.width;
   paths.forEach((p, i) => { gctx.strokeStyle = SHADE[i]; gctx.stroke(p); });
   gctx.fillStyle = 'rgba(255,255,255,.55)'; gctx.fill(dots);
   gctx.globalCompositeOperation = 'source-over';
@@ -391,14 +402,16 @@ async function start(){
     video.srcObject = stream; await video.play();
     mesh.width = video.videoWidth; mesh.height = video.videoHeight;
     running = true; neutral = null; calib = [];
-    $('camBtn').classList.add('on'); $('freezeBtn').disabled = false; $('calBtn').disabled = false; $('posesBtn').disabled = false;
+    $('camBtn').classList.add('on'); $('freezeBtn').disabled = false; $('calBtn').disabled = false;
+    $('startBtn').hidden = busy;
     status('looking for face…');
   } catch (e) { status(`no camera: ${e.message}`); }
 }
 function stop(){
   running = false; stream && stream.getTracks().forEach(t => t.stop());
   mctx.clearRect(0, 0, mesh.width, mesh.height);
-  $('camBtn').classList.remove('on'); $('freezeBtn').disabled = true; $('calBtn').disabled = true; $('posesBtn').disabled = true;
+  $('camBtn').classList.remove('on'); $('freezeBtn').disabled = true; $('calBtn').disabled = true;
+  $('startBtn').hidden = true;
   status('');
 }
 
@@ -613,7 +626,6 @@ const sleep = ms => new Promise(r => setTimeout(r, ms));
 const prompt = t => { $('prompt').textContent = t; };
 async function recordPoses(){
   if (!neutral){ status('hold a relaxed face first'); return; }
-  $('posesBtn').disabled = true;
   for (const [key, say] of POSES){
     for (let c = 3; c > 0; c--){ prompt(`${say}\n${c}`); await sleep(800); }
     prompt(`${say}\nhold…`); poseRec = [];
@@ -626,7 +638,6 @@ async function recordPoses(){
     poses[key] = d; prompt('✓'); await sleep(500);
   }
   prompt(''); status(`poses recorded: ${Object.keys(poses).length} of ${POSES.length}`);
-  $('posesBtn').disabled = false;
 }
 
 /* ---- building blocks for the variable font ----
@@ -645,7 +656,7 @@ function glyphBase(base, ch, capH){
       const ang = (S.angle + REST.twist * Math.sin((capH - y) * SC * 0.017 + x * SC * 0.008)) * D2R;
       const hsh = Math.abs(Math.sin(x * 12.9898 + y * 78.233) * 43758.5453) % 1, na = Math.atan2(nys, nxs);
       const v = Math.max(0, Math.min(1, 0.5 + 0.3*Math.cos(2*(na - Lr)) + 0.16*Math.cos(5*(na - Lr) + ang*3) + (hsh - 0.5)*0.26));
-      return {x, y, ang, w: 0.35 + 1.05 * v * v, turn: (Math.atan2(-(y - cy), x - cx) / (Math.PI * 2) + 1.25) % 1};
+      return {x, y, ang, w: (0.35 + 1.05 * v * v) * S.width, turn: (Math.atan2(-(y - cy), x - cx) / (Math.PI * 2) + 1.25) % 1};
     });
     return {ring, P};
   });
@@ -659,6 +670,37 @@ function tipsFor(gb, li, capH, vec){
     const my = Math.max(-lim, Math.min(lim, (field[b0*2+1] * (1-t) + field[b1*2+1] * t) * capH));
     return [x + Math.sin(ang) * dep + mx, y + Math.cos(ang) * dep - my];
   }));
+}
+// An expression slider keeps the resting look: each line keeps its direction and only grows
+// longer where the face moved (plus a slight sway), with a ceiling, so sliders can be stacked safely.
+const EXPR = {target: 0.32, maxGrow: 0.36, sway: 0.35, maxSway: 0.06, smooth: 5};   // lengths in cap heights; smooth = lines each side averaged
+function exprGain(eVec){
+  // scale each pose so its strongest areas (95th percentile) reach the same length on every slider
+  const f = fieldFor(turnsFor(0), 1, 1, eVec), m = [];
+  for (let b = 0; b < BINS; b++) m.push(Math.hypot(f[b*2], f[b*2+1]));
+  m.sort((a, b) => a - b);
+  const m95 = m[Math.floor(m.length * 0.95)] || 0;
+  return m95 > 1e-6 ? Math.min(EXPR.target * (S.gain / 3) / m95, S.gain * 6) : 0;
+}
+function exprTips(gb, li, capH, tBase, eVec, G){
+  const fe = fieldFor(turnsFor(li), 1, 1, eVec), M = EXPR.maxGrow * capH, SW = EXPR.maxSway * capH;
+  return gb.contours.map(({P}, ci) => {
+    const n = P.length, grow = new Float32Array(n), side = new Float32Array(n);
+    P.forEach(({ang, turn}, k) => {
+      const f = turn * BINS, b0 = Math.floor(f) % BINS, b1 = (b0 + 1) % BINS, t = f - Math.floor(f);
+      const px = (fe[b0*2] * (1-t) + fe[b1*2] * t) * capH * G, py = -(fe[b0*2+1] * (1-t) + fe[b1*2+1] * t) * capH * G;   // font y points up
+      const sa = Math.sin(ang), ca = Math.cos(ang);
+      grow[k] = M * Math.tanh(Math.hypot(px, py) / M);                        // longer where the face moved, softly capped
+      side[k] = SW * Math.tanh((px * ca - py * sa) * EXPR.sway / SW);       // a little sway across the line
+    });
+    // smooth along the outline so neighbouring lines move together and the tips flow in a wave
+    const smooth = a => { for (let pass = 0; pass < 3; pass++){ const c = Float32Array.from(a); for (let k = 0; k < n; k++){ let s = 0; for (let o = -EXPR.smooth; o <= EXPR.smooth; o++) s += c[(k + o + n) % n]; a[k] = s / (2 * EXPR.smooth + 1); } } };
+    smooth(grow); smooth(side);
+    return P.map(({ang}, k) => {
+      const sa = Math.sin(ang), ca = Math.cos(ang), [bx, by] = tBase[ci][k];
+      return [bx + sa * grow[k] + ca * side[k], by + ca * grow[k] - sa * side[k]];
+    });
+  });
 }
 // where to split the line-end edges: wherever ANY version spreads apart, so no version bridges a gap
 function runsFor(allTips){
@@ -745,14 +787,15 @@ async function makeVariableFont(){
   // axes, and for each axis the version of the face at its far end
   const axes = [], variants = [];
   const addAxis = (tag, name, min, d, max) => { axes.push({tag, name, min, def: d, max}); return axes.length - 1; };
-  const LOOK_BOOST = 2.5;                                                               // eye movements are small; make them visible
-  if (poses.mouth){ const a = addAxis('MOUT', 'Mouth open', 0, 0, 100); variants.push({a, peak: 1, v: plus(poses.mouth, S.gain), label: 'Mouth Open'}); }
-  if (poses.smile){ const a = addAxis('SMIL', 'Smile', 0, 0, 100); variants.push({a, peak: 1, v: plus(poses.smile, S.gain), label: 'Smile'}); }
-  if (poses.brows){ const a = addAxis('BROW', 'Brows', 0, 0, 100); variants.push({a, peak: 1, v: plus(poses.brows, S.gain), label: 'Brows Up'}); }
+  // expression sliders: e = how the face moved for that pose, G = its scale (see exprGain)
+  const ex = pose => { const G = exprGain(pose), e = Float32Array.from(pose, d => d * G); return {e, v: plus(e, 1)}; };
+  if (poses.mouth){ const a = addAxis('MOUT', 'Mouth open', 0, 0, 100); variants.push({a, peak: 1, ...ex(poses.mouth), label: 'Mouth Open'}); }
+  if (poses.smile){ const a = addAxis('SMIL', 'Smile', 0, 0, 100); variants.push({a, peak: 1, ...ex(poses.smile), label: 'Smile'}); }
+  if (poses.brows){ const a = addAxis('BROW', 'Brows', 0, 0, 100); variants.push({a, peak: 1, ...ex(poses.brows), label: 'Brows Up'}); }
   if (poses.lookL || poses.lookR){
     const a = addAxis('LOOK', 'Look', -100, 0, 100);
-    if (poses.lookL) variants.push({a, peak: -1, v: plus(poses.lookL, S.gain * LOOK_BOOST), label: 'Look Left'});
-    if (poses.lookR) variants.push({a, peak: 1, v: plus(poses.lookR, S.gain * LOOK_BOOST), label: 'Look Right'});
+    if (poses.lookL) variants.push({a, peak: -1, ...ex(poses.lookL), label: 'Look Left'});
+    if (poses.lookR) variants.push({a, peak: 1, ...ex(poses.lookR), label: 'Look Right'});
   }
   const aL = addAxis('LHLF', 'Left half', 0, 100, 100); variants.push({a: aL, peak: -1, v: plus(shapeL, -1)});
   const aR = addAxis('RHLF', 'Right half', 0, 100, 100); variants.push({a: aR, peak: -1, v: plus(shapeR, -1)});
@@ -789,7 +832,8 @@ async function makeVariableFont(){
   const fam = ($('fontName').value || 'Reflect Face').trim().replace(/[^\w \-]/g, '').slice(0, 28) || 'Reflect Face';
   const family = fam + ' Variable';
   return {...writeTTF({family, glyphs, upm: upm * U, asc: (base.ascender || 878) * U, desc: (base.descender || -210) * U, capH: capH * U, xH: xH * U,
-                       variable: {axes, instances, peaks, glyphs: gv}}), family};
+                       variable: {axes, instances, peaks, glyphs: gv}}), family, axes,
+          vecs: {def, shapeL, shapeR, expr: variants.filter(vr => vr.e).map(vr => ({tag: axes[vr.a].tag, peak: vr.peak, e: vr.e}))}};
 }
 
 /* ---- a minimal TrueType writer ---- */
@@ -904,45 +948,106 @@ async function makeFont(){
   return {...writeTTF({family, glyphs, upm: upm * U, asc: (base.ascender || 878) * U, desc: (base.descender || -210) * U, capH: capH * U, xH: xH * U}), family};
 }
 
-async function downloadFont(variable){
-  const btns = [$('ttfVarBtn')]; btns.forEach(b => b.disabled = true);
-  status(variable ? 'building variable font…' : 'building font…');
+/* ---------- the start button: rest → poses → font → sliders ---------- */
+let busy = false, built = null, rebuildTimer = 0;
+const AXIS_LABELS = {MOUT:'mouth open', SMIL:'smile', BROW:'brow lift', LOOK:'look', LHLF:'left half', RHLF:'right half'};
+const waitFor = async (test, ms) => { const t0 = performance.now(); while (!test()){ if (performance.now() - t0 > ms) return false; await sleep(50); } return true; };
+
+async function runStart(){
+  if (busy || !running) return;
+  busy = true; $('startBtn').hidden = true; $('ttfVarBtn').disabled = true;
   try {
-    const {buf, ps} = variable ? await makeVariableFont() : await makeFont();
+    // 1. your resting face (the camera drives the lines again while you pose)
+    previewVec = null; dirty = true;
+    frozen = false; $('freezeBtn').textContent = 'freeze';
+    neutral = null; calib = [];
+    prompt('relax your face\nlook straight');
+    if (!await waitFor(() => neutral, 15000)){ prompt(''); status('no face found: sit in front of the camera and press start again'); return; }
+    prompt('✓'); await sleep(600);
+    // 2. the expressions
+    for (const k of Object.keys(poses)) delete poses[k];
+    await recordPoses();
+    // 3. the font
+    prompt('making your font…');
+    await buildFont();
+    prompt('');
+  } catch (e) { prompt(''); status(`font failed: ${e.message}`); }
+  finally { busy = false; if (running){ $('startBtn').textContent = 'start again'; $('startBtn').hidden = false; } }
+}
+
+// build the variable font from the recorded face, load it into the page and show its sliders
+async function buildFont(){
+  status('building your variable font…');
+  const r = await makeVariableFont();
+  built = {...r, name: $('fontName').value};
+  showFont(r.axes);
+  $('ttfVarBtn').disabled = false;
+  status(`${r.family} is ready: try the sliders, then download`);
+}
+
+const axisVals = {};
+function showFont(axes){
+  const box = $('axes'); box.innerHTML = ''; box.hidden = false;
+  axes.forEach(ax => {
+    if (!(ax.tag in axisVals)) axisVals[ax.tag] = ax.def;
+    const v = Math.max(ax.min, Math.min(ax.max, axisVals[ax.tag]));
+    axisVals[ax.tag] = v;
+    const lab = document.createElement('label');
+    lab.innerHTML = `${AXIS_LABELS[ax.tag] || ax.name} <b>${v}</b><input type="range" id="ax-${ax.tag}" min="${ax.min}" max="${ax.max}" value="${v}">`;
+    lab.querySelector('input').oninput = e => { axisVals[ax.tag] = +e.target.value; lab.querySelector('b').textContent = e.target.value; applyAxes(); };
+    box.appendChild(lab);
+  });
+  applyAxes();
+}
+// the same sum the font does: each half of your face shape, plus each expression by its slider
+function applyAxes(){
+  if (!built) return;
+  const {def, shapeL, shapeR, expr} = built.vecs, out = new Float32Array(def.length);
+  const l = (axisVals.LHLF ?? 100) / 100, r = (axisVals.RHLF ?? 100) / 100;
+  for (let j = 0; j < out.length; j++) out[j] = shapeL[j] * l + shapeR[j] * r;
+  for (const x of expr){
+    const t = (axisVals[x.tag] ?? 0) / 100 * x.peak;      // look: −100 uses look left, +100 look right
+    if (t > 0) for (let j = 0; j < out.length; j++) out[j] += x.e[j] * t;
+  }
+  previewVec = out; dirty = true;
+}
+// settings that change the drawing rebuild the font (after a short pause), once it exists
+function scheduleRebuild(){
+  if (!built) return;
+  clearTimeout(rebuildTimer);
+  status('updating your font…');
+  rebuildTimer = setTimeout(() => { if (!busy) buildFont().catch(e => status(`font failed: ${e.message}`)); }, 500);
+}
+
+async function downloadVariable(){
+  if (!built) return;
+  $('ttfVarBtn').disabled = true;
+  try {
+    if (built.name !== $('fontName').value){ await buildFont(); }   // renamed since it was built
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([buf], {type:'font/ttf'})); a.download = `${ps}.ttf`; a.click();
-    status(`downloaded ${ps}.ttf`);
+    a.href = URL.createObjectURL(new Blob([built.buf], {type:'font/ttf'})); a.download = `${built.ps}.ttf`; a.click();
+    status(`downloaded ${built.ps}.ttf`);
   } catch (e) { status(`font failed: ${e.message}`); }
-  btns.forEach(b => b.disabled = false);
+  $('ttfVarBtn').disabled = false;
 }
 
 /* ---------- controls ---------- */
-$('camBtn').onclick = () => running ? stop() : start();
-$('camBtn').onkeydown = e => { if (e.key === 'Enter' || e.key === ' '){ e.preventDefault(); running ? stop() : start(); } };
+$('camBtn').onclick = () => { if (!busy) running ? stop() : start(); };
+$('camBtn').onkeydown = e => { if ((e.key === 'Enter' || e.key === ' ') && !busy){ e.preventDefault(); running ? stop() : start(); } };
+$('startBtn').onclick = runStart;
 $('freezeBtn').onclick = () => { frozen = !frozen; $('freezeBtn').textContent = frozen ? 'unfreeze' : 'freeze';
   status(frozen ? 'frozen' : 'tracking'); };
-$('calBtn').onclick = () => { neutral = null; calib = []; frozen = false; $('freezeBtn').textContent = 'freeze'; };
+$('calBtn').onclick = () => { if (busy) return; neutral = null; calib = []; frozen = false; $('freezeBtn').textContent = 'freeze'; };
 $('text').oninput = e => { S.text = e.target.value; layout(); };
-$('shape').oninput = e => { S.shape = +e.target.value; $('shapeVal').textContent = `${S.shape}×`; dirty = true; };
-$('gain').oninput = e => { S.gain = +e.target.value; $('gainVal').textContent = `${S.gain}×`; dirty = true; };
-$('base').oninput = e => { S.base = +e.target.value; $('baseVal').textContent = S.base; dirty = true; };
-$('modeBtn').onclick = () => { mode = mode === 'random' ? 'matched' : 'random'; $('modeBtn').textContent = `mapping: ${mode}`; $('shuffleBtn').disabled = mode !== 'random'; buildMapping(); };
-$('shuffleBtn').onclick = () => { seed = Math.floor(Math.random() * 1e6); buildMapping(); };
-// the variable font needs your poses: if they aren't recorded yet, record them first, then download
-$('ttfVarBtn').onclick = async () => {
-  if (Object.keys(poses).length < POSES.length){
-    if (!running || !neutral){ status('start the camera and relax first: the variable font records your poses'); return; }
-    $('ttfVarBtn').disabled = true;
-    await recordPoses();
-    $('ttfVarBtn').disabled = false;
-  }
-  downloadFont(true);
-};
-$('posesBtn').onclick = recordPoses;
+$('width').oninput = e => { S.width = +e.target.value; $('widthVal').textContent = `${S.width}×`; dirty = true; scheduleRebuild(); };
+$('base').oninput = e => { S.base = +e.target.value; $('baseVal').textContent = S.base; dirty = true; scheduleRebuild(); };
+$('modeBtn').onclick = () => { mode = mode === 'random' ? 'matched' : 'random'; $('modeBtn').textContent = `mapping: ${mode}`; $('shuffleBtn').disabled = mode !== 'random'; buildMapping(); scheduleRebuild(); };
+$('shuffleBtn').onclick = () => { seed = Math.floor(Math.random() * 1e6); buildMapping(); scheduleRebuild(); };
+$('ttfVarBtn').onclick = downloadVariable;
 $('savePng').onclick = () => { const a = document.createElement('a'); a.href = canvas.toDataURL('image/png'); a.download = `478-${S.text}.png`; a.click(); };
 
 // testing hook: feed made-up faces through the same pipeline (no camera needed)
-window.__face478 = { _testCameraOn: () => { running = true; }, CANON, makeFont, makeVariableFont, setPose: (k, v) => { poses[k] = v; }, poses: () => Object.keys(poses), normalize, update, setNeutral, shuffle: v => { seed = v; buildMapping(); }, setMode: m => { mode = m; buildMapping(); }, get neutral(){ return neutral; } };
+window.__face478 = { _testCameraOn: () => { running = true; $('startBtn').hidden = false; }, CANON, makeFont, makeVariableFont, setPose: (k, v) => { poses[k] = v; }, EXPR, poses: () => Object.keys(poses), normalize, update, setNeutral, shuffle: v => { seed = v; buildMapping(); }, setMode: m => { mode = m; buildMapping(); }, get neutral(){ return neutral; } };
 
 new ResizeObserver(layout).observe(canvas);
 document.fonts && document.fonts.load(`100px ${FONT}`).then(layout);
